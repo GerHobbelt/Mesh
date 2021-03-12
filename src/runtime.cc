@@ -384,7 +384,8 @@ bool Runtime::jobFreeCmd() {
     }
 
     case internal::FreeCmd::FREE_DIRTY_PAGE: {
-      std::sort(fCommand->spans.begin(), fCommand->spans.end());
+      ska_sort(fCommand->spans.begin(), fCommand->spans.end(),
+               [](auto &&span) -> decltype(auto) { return span.offset; });
       mergeSpans(fCommand->spans);
       for (auto &span : fCommand->spans) {
         rt.heap().freePhys(span);

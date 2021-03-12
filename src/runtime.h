@@ -11,7 +11,7 @@
 #include <thread>
 #include <algorithm>
 #include <signal.h>  // for stack_t
-
+#include "ska_sort.hpp"
 #include "internal.h"
 
 #include "real.h"
@@ -109,7 +109,7 @@ public:
     tmp.reserve(_flushSpans.size() + spans.size());
 
     if (!sorted) {
-      std::sort(spans.begin(), spans.end());
+      ska_sort(spans.begin(), spans.end(), [](auto &&span) -> decltype(auto) { return span.offset; });
     }
 
     std::merge(_flushSpans.begin(), _flushSpans.end(), spans.begin(), spans.end(), std::back_inserter(tmp));

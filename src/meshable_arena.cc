@@ -26,6 +26,7 @@
 #include "meshable_arena.h"
 #include "mini_heap.h"
 #include "runtime.h"
+#include "ska_sort.hpp"
 
 namespace mesh {
 
@@ -515,7 +516,8 @@ void MeshableArena::getSpansFromBg(bool wait) {
   }
 
   if (needSort) {
-    std::sort(_clean[kSpanClassCount - 1].begin(), _clean[kSpanClassCount - 1].end(), customLess);
+    ska_sort(_clean[kSpanClassCount - 1].begin(), _clean[kSpanClassCount - 1].end(),
+             [](auto &&span) -> decltype(auto) { return -span.offset; });
   }
   // debug("getSpansFromBg after sort last");
   // for(size_t i = 0; i < kSpanClassCount; ++i) {
