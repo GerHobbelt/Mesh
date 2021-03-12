@@ -517,7 +517,7 @@ void MeshableArena::getSpansFromBg(bool wait) {
 
   if (needSort) {
     ska_sort(_clean[kSpanClassCount - 1].begin(), _clean[kSpanClassCount - 1].end(),
-             [](auto &&span) -> decltype(auto) { return -span.offset; });
+             [](auto &&span) -> decltype(auto) { return span.length; });
   }
   // debug("getSpansFromBg after sort last");
   // for(size_t i = 0; i < kSpanClassCount; ++i) {
