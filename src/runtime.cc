@@ -520,13 +520,13 @@ int Runtime::sigaction(int signum, const struct sigaction *act, struct sigaction
   }
 
   if (oldact)
-    memcpy(oldact, nextAct, sizeof(*nextAct));
+    _mesh_memcpy(oldact, nextAct, sizeof(*nextAct));
 
   if (act == nullptr) {
     memset(nextAct, 0, sizeof(*nextAct));
   } else {
     // debug("TODO: user installed a segfault handler");
-    memcpy(nextAct, act, sizeof(*nextAct));
+    _mesh_memcpy(nextAct, act, sizeof(*nextAct));
   }
 
   return 0;

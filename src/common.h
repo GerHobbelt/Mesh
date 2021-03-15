@@ -23,6 +23,11 @@
 #include <unistd.h>
 #endif
 
+#if defined(_WIN32) && (defined(_M_IX86) || defined(_M_X64))
+#include <intrin.h>
+#endif
+
+#include <string.h>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -429,5 +434,72 @@ public:
   }
 };
 }  // namespace mesh
+
+// ------------------------------------------------------
+// Size of a pointer.
+// We assume that `sizeof(void*)==sizeof(intptr_t)`
+// and it holds for all platforms we know of.
+//
+// However, the C standard only requires that:
+//  p == (void*)((intptr_t)p))
+// but we also need:
+//  i == (intptr_t)((void*)i)
+// or otherwise one might define an intptr_t type that is larger than a pointer...
+// ------------------------------------------------------
+
+#if INTPTR_MAX == 9223372036854775807LL
+#define MESH_INTPTR_SHIFT (3)
+#elif INTPTR_MAX == 2147483647LL
+#define MESH_INTPTR_SHIFT (2)
+#else
+#error platform must be 32 or 64 bits
+#endif
+
+#define MESH_INTPTR_SIZE (1 << MESH_INTPTR_SHIFT)
+#define MESH_INTPTR_BITS (MESH_INTPTR_SIZE * 8)
+
+// ---------------------------------------------------------------------------------
+// Provide our own `_mesh_memcpy` for potential performance optimizations.
+//
+// For now, only on Windows with msvc/clang-cl we optimize to `rep movsb` if
+// we happen to run on x86/x64 cpu's that have "fast short rep movsb" (FSRM) support
+// (AMD Zen3+ (~2020) or Intel Ice Lake+ (~2017). See also issue #201 and pr #253.
+// ---------------------------------------------------------------------------------
+
+#if defined(_WIN32) && (defined(_M_IX86) || defined(_M_X64))
+extern bool _mesh_cpu_has_fsrm;
+static inline void _mesh_memcpy(void *dst, const void *src, size_t n) {
+  if (_mesh_cpu_has_fsrm) {
+    __movsb((unsigned char *)dst, (const unsigned char *)src, n);
+  } else {
+    memcpy(dst, src, n);  // todo: use noinline?
+  }
+}
+#else
+static inline void _mesh_memcpy(void *dst, const void *src, size_t n) {
+  memcpy(dst, src, n);
+}
+#endif
+
+// -------------------------------------------------------------------------------
+// The `_mesh_memcpy_aligned` can be used if the pointers are machine-word aligned
+// This is used for example in `mi_realloc`.
+// -------------------------------------------------------------------------------
+
+#if (__GNUC__ >= 4) || defined(__clang__)
+// On GCC/CLang we provide a hint that the pointers are word aligned.
+static inline void _mesh_memcpy_aligned(void *dst, const void *src, size_t n) {
+  d_assert(((uintptr_t)dst % MESH_INTPTR_SIZE == 0) && ((uintptr_t)src % MESH_INTPTR_SIZE == 0));
+  void *adst = __builtin_assume_aligned(dst, MESH_INTPTR_SIZE);
+  const void *asrc = __builtin_assume_aligned(src, MESH_INTPTR_SIZE);
+  memcpy(adst, asrc, n);
+}
+#else
+// Default fallback on `_mesh_memcpy`
+static inline void _mesh_memcpy_aligned(void *dst, const void *src, size_t n) {
+  d_assert(((uintptr_t)dst % MESH_INTPTR_SIZE == 0) && ((uintptr_t)src % MESH_INTPTR_SIZE == 0));
+  _mesh_memcpy(dst, src, n);
+}
+#endif
 
 #endif  // MESH_COMMON_H

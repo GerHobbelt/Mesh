@@ -258,7 +258,7 @@ public:
       void *dstObject = mallocAt(arenaBegin, off);
       // debug("meshing: %zu (%p <- %p)\n", off, dstObject, srcObject);
       d_assert(dstObject != nullptr);
-      memcpy(dstObject, srcObject, objectSize);
+      _mesh_memcpy_aligned(dstObject, srcObject, objectSize);
       // debug("\t'%s'\n", dstObject);
       // debug("\t'%s'\n", srcObject);
     }

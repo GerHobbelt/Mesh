@@ -10,7 +10,26 @@
 
 using namespace mesh;
 
+#if defined(_WIN32) && (defined(_M_IX86) || defined(_M_X64))
+#include <intrin.h>
+bool _mesh_cpu_has_fsrm = false;
+
+static void mesh_detect_cpu_features(void) {
+  // FSRM for fast rep movsb support (AMD Zen3+ (~2020) or Intel Ice Lake+ (~2017))
+  int32_t cpu_info[4];
+  __cpuid(cpu_info, 7);
+  _mesh_cpu_has_fsrm =
+      ((cpu_info[3] & (1 << 4)) !=
+       0);  // bit 4 of EDX : see <https ://en.wikipedia.org/wiki/CPUID#EAX=7,_ECX=0:_Extended_Features>
+}
+#else
+static void mesh_detect_cpu_features(void) {
+  // nothing
+}
+#endif
+
 static __attribute__((constructor)) void libmesh_init() {
+  mesh_detect_cpu_features();
   mesh::real::init();
 
   runtime().createSignalFd();

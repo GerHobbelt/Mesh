@@ -137,7 +137,7 @@ public:
         return nullptr;
       }
       const size_t copySize = (oldSize < newSize) ? oldSize : newSize;
-      memcpy(newPtr, oldPtr, copySize);
+      _mesh_memcpy(newPtr, oldPtr, copySize);
       this->free(oldPtr);
       return newPtr;
     } else {
