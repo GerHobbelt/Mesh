@@ -64,6 +64,23 @@ public:
     return map(sz, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1);
   }
 
+  inline void *thp_malloc(size_t sz) {
+    if (kAdviseHugePage && sz >= kHugePageSize) {
+      sz = sz + kHugePageSize;
+      void *p = malloc(sz);
+      if (p) {
+        madvise(p, sz, MADV_HUGEPAGE);
+      }
+      size_t ptr = reinterpret_cast<size_t>(p);
+      size_t alignedPtr = (ptr + kHugePageSize - 1) & ((size_t) ~(kHugePageSize - 1));
+      if (ptr != alignedPtr) {
+        munmap(p, alignedPtr - ptr);
+      }
+      return reinterpret_cast<void *>(alignedPtr);
+    }
+    return malloc(sz);
+  }
+
   inline size_t getSize(void *ATTRIBUTE_UNUSED ptr) const {
     return 0;
   }

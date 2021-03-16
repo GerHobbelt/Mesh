@@ -51,7 +51,7 @@ MeshableArena::MeshableArena() : SuperHeap(), _fastPrng(internal::seed(), intern
   }
   _fd = fd;
   _arenaBegin = SuperHeap::map(kArenaSize, kMapShared, fd);
-  _mhIndex = reinterpret_cast<atomic<MiniHeapID> *>(SuperHeap::malloc(indexSize()));
+  _mhIndex = reinterpret_cast<atomic<MiniHeapID> *>(SuperHeap::thp_malloc(indexSize()));
 
   hard_assert(_arenaBegin != nullptr);
   hard_assert(_mhIndex != nullptr);

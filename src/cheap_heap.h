@@ -28,16 +28,16 @@ public:
 
   CheapHeap() : SuperHeap() {
     // TODO: check allocSize + maxCount doesn't overflow?
-    _arena = reinterpret_cast<char *>(SuperHeap::malloc(allocSize * maxCount));
-    _freelist = reinterpret_cast<void **>(SuperHeap::malloc(maxCount * sizeof(void *)));
+    _arena = reinterpret_cast<char *>(SuperHeap::thp_malloc(allocSize * maxCount));
+    _freelist = reinterpret_cast<void **>(SuperHeap::thp_malloc(maxCount * sizeof(void *)));
     hard_assert(_arena != nullptr);
     hard_assert(_freelist != nullptr);
     d_assert(reinterpret_cast<uintptr_t>(_arena) % Alignment == 0);
     d_assert(reinterpret_cast<uintptr_t>(_freelist) % Alignment == 0);
 
     if (kAdviseDump) {
-      madvise(_arena, allocSize * maxCount, MADV_DONTDUMP);
-      madvise(_freelist, maxCount * sizeof(void *), MADV_DONTDUMP);
+      madvise(_arena, allocSize * maxCount, MADV_DONTDUMP | (kAdviseHugePage ? MADV_HUGEPAGE : 0));
+      madvise(_freelist, maxCount * sizeof(void *), MADV_DONTDUMP | (kAdviseHugePage ? MADV_HUGEPAGE : 0));
     }
   }
 
@@ -54,12 +54,12 @@ public:
     if (kAdviseDump) {
       // only call madvise at a new page
       if ((uint64_t)ptr % kPageSize == 0) {
-        madvise(ptr, kPageSize, MADV_DODUMP);
+        madvise(ptr, kPageSize, MADV_DODUMP | (kAdviseHugePage ? MADV_HUGEPAGE : 0));
       }
 
       void *freelistPage = _freelist + off * sizeof(void *);
       if ((uint64_t)freelistPage % kPageSize == 0) {
-        madvise(freelistPage, kPageSize, MADV_DODUMP);
+        madvise(freelistPage, kPageSize, MADV_DODUMP | (kAdviseHugePage ? MADV_HUGEPAGE : 0));
       }
     }
 

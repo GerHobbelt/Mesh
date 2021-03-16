@@ -78,6 +78,7 @@ static constexpr size_t kClassSizesMax = 37;
 static constexpr size_t kAlignment = 8;
 static constexpr int kMinAlign = 16;
 static constexpr uint64_t kPageSize = 4096;
+static constexpr uint64_t kHugePageSize = 4096 * 512;
 static constexpr size_t kMaxFastLargeSize = 256 * 1024;  // 256Kb
 
 static constexpr size_t kMaxSplitListSize = 16384;
@@ -121,6 +122,9 @@ static constexpr bool kEnableShuffleOnFree = SHUFFLE_ON_FREE == 1;
 
 // madvise(DONTDUMP) the heap to make reasonable coredumps
 static constexpr bool kAdviseDump = true;
+
+// madvise(MADV_HUGEPAGE)
+static constexpr bool kAdviseHugePage = true;
 
 static constexpr std::chrono::milliseconds kZeroMs{0};
 static constexpr std::chrono::milliseconds kMeshPeriodMs{100};  // 100 ms
