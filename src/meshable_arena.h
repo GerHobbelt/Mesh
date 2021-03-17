@@ -236,6 +236,11 @@ private:
     } else if (flags == internal::PageType::Meshed) {
       // delay restoring the identity mapping
       decMeshedSpanCount(span.length);
+
+      if (_isCOWRunning) {
+        trackCOWed(span);
+      }
+
       _toReset.push_back(span);
     }
   }
