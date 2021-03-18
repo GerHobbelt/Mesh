@@ -58,47 +58,81 @@ public:
 
   inline bool contains(const void *ptr) const {
     auto arena = reinterpret_cast<uintptr_t>(_arenaBegin);
+    auto end = reinterpret_cast<uintptr_t>(_arenaEnd);
     auto ptrval = reinterpret_cast<uintptr_t>(ptr);
-    return arena <= ptrval && ptrval < arena + kArenaSize;
+    return arena <= ptrval && ptrval < end;
   }
 
   char *pageAlloc(Span &result, size_t pageCount, size_t pageAlignment = 1);
 
   void free(void *ptr, size_t sz, internal::PageType type);
 
-  inline void trackMiniHeap(const Span span, MiniHeapID id) {
+  inline void trackMiniHeap(const Span span, MiniHeap *mh, int sizeClass) {
     // now that we know they are available, set the empty pages to
     // in-use.  This is safe because this whole function is called
     // under the GlobalHeap lock, so there is no chance of concurrent
     // modification between the loop above and the one below.
+    //
+    size_t index = ((size_t)(mh)) | ((size_t)(sizeClass) << kPtrOffset);
     for (size_t i = 0; i < span.length; i++) {
 #ifndef NDEBUG
-      d_assert(!_mhIndex[span.offset + i].load(std::memory_order_acquire).hasValue());
 // auto mh = reinterpret_cast<MiniHeap *>(miniheapForArenaOffset(span.offset + i));
 // mh->dumpDebug();
 #endif
-      setIndex(span.offset + i, id);
+      setIndex(span.offset + i, index);
+    }
+  }
+
+  inline void trackMeshedMiniHeap(const Span span, MiniHeap *mh) {
+    // make meshed mh sizeClass == 0
+    // so ThreadLocalCache won't cache it when free
+    size_t index = reinterpret_cast<size_t>(mh);
+    for (size_t i = 0; i < span.length; i++) {
+      setIndex(span.offset + i, index);
     }
   }
 
   inline void *ATTRIBUTE_ALWAYS_INLINE miniheapForArenaOffset(Offset arenaOff) const {
-    const MiniHeapID mhOff = _mhIndex[arenaOff].load(std::memory_order_acquire);
-    if (likely(mhOff.hasValue())) {
-      return _mhAllocator.ptrFromOffset(mhOff.value());
-    }
+    return reinterpret_cast<void *>(_mhIndex[arenaOff].load(std::memory_order_acquire) & kPtrMask);
+  }
 
-    return nullptr;
+  inline int ATTRIBUTE_ALWAYS_INLINE sizeClassForArenaOffset(Offset arenaOff) const {
+    size_t val = _mhIndex[arenaOff].load(std::memory_order_acquire);
+    return static_cast<int>(val >> kPtrOffset);
   }
 
   inline void *ATTRIBUTE_ALWAYS_INLINE lookupMiniheap(const void *ptr) const {
-    if (unlikely(!contains(ptr))) {
+    const uintptr_t ptrval = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t arena = reinterpret_cast<uintptr_t>(_arenaBegin);
+    const uintptr_t end = reinterpret_cast<uintptr_t>(_arenaEnd);
+
+    d_assert(ptrval >= arena);
+
+    if (unlikely(ptrval < arena || ptrval >= end)) {
       return nullptr;
     }
 
     // we've already checked contains, so we know this offset is
     // within bounds
-    const auto arenaOff = offsetFor(ptr);
+    const auto arenaOff = (ptrval - arena) / kPageSize;
     return miniheapForArenaOffset(arenaOff);
+  }
+
+  inline int ATTRIBUTE_ALWAYS_INLINE lookupSizeClass(const void *ptr) const {
+    const uintptr_t ptrval = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t arena = reinterpret_cast<uintptr_t>(_arenaBegin);
+    const uintptr_t end = reinterpret_cast<uintptr_t>(_arenaEnd);
+
+    d_assert(ptrval >= arena);
+
+    if (unlikely(ptrval < arena || ptrval >= end)) {
+      return kClassSizesMax;
+    }
+
+    // we've already checked contains, so we know this offset is
+    // within bounds
+    const auto arenaOff = (ptrval - arena) / kPageSize;
+    return sizeClassForArenaOffset(arenaOff);
   }
 
   void beginMesh(void *keep, void *remove, size_t sz);
@@ -137,7 +171,7 @@ public:
     return reinterpret_cast<char *>(_arenaBegin);
   }
   void *arenaEnd() const {
-    return reinterpret_cast<char *>(_arenaBegin) + kArenaSize;
+    return reinterpret_cast<char *>(_arenaEnd);
   }
 
   void doAfterForkChild();
@@ -184,13 +218,13 @@ private:
 
   static constexpr size_t indexSize() {
     // one pointer per page in our arena
-    return sizeof(Offset) * (kArenaSize / kPageSize);
+    return sizeof(size_t) * (kArenaSize / kPageSize);
   }
 
   inline void clearIndex(const Span &span) {
     for (size_t i = 0; i < span.length; i++) {
       // clear the miniheap pointers we were tracking
-      setIndex(span.offset + i, MiniHeapID{0});
+      setIndex(span.offset + i, 0u);
     }
   }
 
@@ -267,7 +301,7 @@ private:
     return reinterpret_cast<void *>(ptrvalFromOffset(off));
   }
 
-  inline void setIndex(size_t off, MiniHeapID val) {
+  inline void setIndex(size_t off, size_t val) {
     d_assert(off < indexSize());
     _mhIndex[off].store(val, std::memory_order_release);
   }
@@ -292,8 +326,9 @@ private:
   void afterForkParentAndChild();
 
   void *_arenaBegin{nullptr};
+  void *_arenaEnd{nullptr};
   // indexed by page offset.
-  atomic<MiniHeapID> *_mhIndex{nullptr};
+  atomic<size_t> *_mhIndex{nullptr};
 
 protected:
   inline void trackCOWed(const Span &span) {

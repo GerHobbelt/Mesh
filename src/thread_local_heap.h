@@ -51,9 +51,9 @@ public:
         _maxObjectSize(SizeMap::ByteSizeForClass(kNumBins - 1)) {
     const auto arenaBegin = _global->arenaBegin();
     // when asked, give 16-byte allocations for 0-byte requests
-    _shuffleVector[0].initialInit(arenaBegin, 1);
+    _shuffleVector[0].initialInit(arenaBegin, 1, &_shuffleCache[0]);
     for (size_t i = 1; i < kNumBins; i++) {
-      _shuffleVector[i].initialInit(arenaBegin, i);
+      _shuffleVector[i].initialInit(arenaBegin, i, &_shuffleCache[i]);
     }
     d_assert(_global != nullptr);
   }
@@ -69,9 +69,9 @@ public:
 
   void releaseAll();
 
+  void ATTRIBUTE_NEVER_INLINE CACHELINE_ALIGNED_FN releaseToCenter(size_t sizeClass);
+  void ATTRIBUTE_NEVER_INLINE CACHELINE_ALIGNED_FN releaseToCenter();
   void *ATTRIBUTE_NEVER_INLINE CACHELINE_ALIGNED_FN smallAllocSlowpath(size_t sizeClass);
-  void *ATTRIBUTE_NEVER_INLINE CACHELINE_ALIGNED_FN smallAllocGlobalRefill(ShuffleVector &shuffleVector,
-                                                                           size_t sizeClass);
 
   inline void *memalign(size_t alignment, size_t size) {
     // Check for non power-of-two alignment.
@@ -180,26 +180,32 @@ public:
       return _global->malloc(sz);
     }
 
-    ShuffleVector &shuffleVector = _shuffleVector[sizeClass];
-    if (unlikely(shuffleVector.isExhausted())) {
+    ShuffleCache &shuffleCache = _shuffleCache[sizeClass];
+    if (unlikely(shuffleCache.isExhausted())) {
       return smallAllocSlowpath(sizeClass);
     }
 
-    return shuffleVector.malloc();
+    return shuffleCache.malloc();
   }
 
   inline void ATTRIBUTE_ALWAYS_INLINE free(void *ptr) {
     if (unlikely(ptr == nullptr))
       return;
 
-    size_t startEpoch{0};
-    auto mh = _global->miniheapForWithEpoch(ptr, startEpoch);
-    if (likely(mh && mh->current() == _current)) {
-      ShuffleVector &shuffleVector = _shuffleVector[mh->sizeClass()];
-      shuffleVector.free(mh, ptr);
+    ++_freeCount;
+    const int sizeClass = _global->lookupSizeClass(ptr);
+    if (likely(sizeClass && sizeClass < kNumBins)) {
+      ShuffleCache &shuffleCache = _shuffleCache[sizeClass];
+      if (unlikely(shuffleCache.isFull())) {
+        releaseToCenter(sizeClass);
+      }
+      shuffleCache.free(ptr);
       return;
     }
-    _global->freeFor(mh, ptr, startEpoch);
+    if (unlikely(_freeCount > 256)) {
+      releaseToCenter();
+    }
+    _global->free(ptr);
   }
 
   inline void ATTRIBUTE_ALWAYS_INLINE sizedFree(void *ptr, size_t sz) {
@@ -210,12 +216,10 @@ public:
     if (unlikely(ptr == nullptr))
       return 0;
 
-    auto mh = _global->miniheapFor(ptr);
-    if (likely(mh && mh->current() == _current)) {
-      ShuffleVector &shuffleVector = _shuffleVector[mh->sizeClass()];
-      return shuffleVector.getSize();
+    const int sizeClass = _global->lookupSizeClass(ptr);
+    if (likely(sizeClass && sizeClass < kNumBins)) {
+      return SizeMap::ByteSizeForClass(sizeClass);
     }
-
     return _global->getSize(ptr);
   }
 
@@ -242,9 +246,11 @@ public:
 
 protected:
   ShuffleVector _shuffleVector[kNumBins] CACHELINE_ALIGNED;
+  ShuffleCache _shuffleCache[kNumBins];
   // this cacheline is read-mostly (only changed when creating + destroying threads)
   const pid_t _current CACHELINE_ALIGNED{0};
   GlobalHeap *_global;
+  size_t _freeCount{0};
   ThreadLocalHeap *_next{};  // protected by global heap lock
   ThreadLocalHeap *_prev{};
   const pthread_t _pthreadCurrent;

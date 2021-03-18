@@ -143,6 +143,10 @@ public:
     return popcount64(_bits[0]) + popcount64(_bits[1]) + popcount64(_bits[2]) + popcount64(_bits[3]);
   }
 
+  inline uint32_t ATTRIBUTE_ALWAYS_INLINE inUseCount1() const {
+    return popcount64(_bits[0]);
+  }
+
   template <class Word>
   void setBits(const Word *bits) {
     for (size_t i = 0; i < wordCount(representationSize(maxBits)); i++) {

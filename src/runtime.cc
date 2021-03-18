@@ -412,10 +412,11 @@ bool Runtime::jobFreeCmd() {
       break;
     }
 
-    case internal::FreeCmd::FLUSH: {
+    case internal::FreeCmd::FLUSH:
+    case internal::FreeCmd::FLUSH_ALL: {
       auto &spans = rt.getFlushSpans();
       mergeSpans(spans);
-      // debug("FLUSH mergeSpans:  merge: %d -> %d\n", mergeCount, spans.size());
+      // debug("FLUSH_ALL mergeSpans:  merge: %d -> %d\n", mergeCount, spans.size());
       fCommand->spans.swap(spans);
       rt._pagesReturnCmdBuffer->push(fCommand);
       break;

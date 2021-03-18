@@ -40,6 +40,10 @@ void *GlobalHeap::malloc(size_t sz) {
 }
 
 void GlobalHeap::free(void *ptr) {
+  if (unlikely(ptr == nullptr)) {
+    return;
+  }
+
   size_t startEpoch{0};
   auto mh = miniheapForWithEpoch(ptr, startEpoch);
   if (unlikely(!mh)) {
@@ -54,14 +58,6 @@ void GlobalHeap::free(void *ptr) {
 }
 
 void GlobalHeap::freeFor(MiniHeap *mh, void *ptr, size_t startEpoch) {
-  if (unlikely(ptr == nullptr)) {
-    return;
-  }
-
-  if (unlikely(!mh)) {
-    return;
-  }
-
   // large objects are tracked with a miniheap per object and don't
   // trigger meshing, because they are multiples of the page size.
   // This can also include, for example, single page allocations w/
@@ -73,12 +69,6 @@ void GlobalHeap::freeFor(MiniHeap *mh, void *ptr, size_t startEpoch) {
   }
 
   d_assert(mh->maxCount() > 1);
-
-  // try to avoid storing to this cacheline; the branch is worth it to avoid
-  // multi-threaded contention
-  if (_lastMeshEffective.load(std::memory_order::memory_order_acquire) == 0) {
-    _lastMeshEffective.store(1, std::memory_order::memory_order_release);
-  }
 
   const auto off = mh->getOff(arenaBegin(), ptr);
   auto sizeClass = mh->sizeClass();
@@ -104,7 +94,7 @@ void GlobalHeap::freeFor(MiniHeap *mh, void *ptr, size_t startEpoch) {
   // it alwasy return false, but in this case, you need to free again.
   auto wasSet = mh->clearIfNotFree(off);
 
-  bool shouldMesh = false;
+  // bool shouldMesh = false;
 
   // the epoch will be odd if a mesh was in progress when we looked up
   // the miniheap; if that is true, or a meshing started between then
@@ -151,8 +141,6 @@ void GlobalHeap::freeFor(MiniHeap *mh, void *ptr, size_t startEpoch) {
       if (unlikely(shouldFlush)) {
         flushBinLocked(sizeClass);
       }
-    } else {
-      shouldMesh = true;
     }
   } else {
     // the free went through ok; if we _were_ full, or now _are_ empty,
@@ -171,13 +159,7 @@ void GlobalHeap::freeFor(MiniHeap *mh, void *ptr, size_t startEpoch) {
       if (unlikely(shouldFlush)) {
         flushBinLocked(sizeClass);
       }
-    } else {
-      shouldMesh = !isAttached;
     }
-  }
-
-  if (shouldMesh) {
-    maybeMesh();
   }
 }
 
@@ -277,7 +259,7 @@ void GlobalHeap::meshLocked(MiniHeap *dst, MiniHeap *&src, internal::vector<Span
   });
   // Super::freePhys(reinterpret_cast<void *>(src->getSpanStart(arenaBegin())), dstSpanSize);
   fCmdSpans.emplace_back(src->span());
-
+  Super::trackMeshedMiniHeap(src->span(), src);
   Super::incMeshedSpanCount(dst->span().length);
   // make sure we adjust what bin the destination is in -- it might
   // now be full and not a candidate for meshing
@@ -336,7 +318,7 @@ size_t GlobalHeap::meshSizeClassLocked(size_t sizeClass, MergeSetArray &mergeSet
         return mergeSetCount < kMaxMergeSets;
       });
 
-  method::shiftedSplitting(_fastPrng, &_partialFreelist[sizeClass].first, all, meshFound);
+  method::shiftedSplitting(_fastPrng, sizeClass, &_partialFreelist[sizeClass].first, all, meshFound);
 
   if (mergeSetCount == 0) {
     // debug("nothing to mesh. sizeClass = %d", sizeClass);
@@ -423,9 +405,9 @@ void GlobalHeap::meshAllSizeClassesLocked() {
     return;
   }
 
-  if (!_lastMeshEffective.load(std::memory_order::memory_order_acquire)) {
-    return;
-  }
+  // if (!_lastMeshEffective.load(std::memory_order::memory_order_acquire)) {
+  //   return;
+  // }
 
   lock_guard<EpochLock> epochLock(_meshEpoch);
 
@@ -441,7 +423,6 @@ void GlobalHeap::meshAllSizeClassesLocked() {
   d_assert(_lastMeshClass < kNumBins);
 
   flushBinLocked(_lastMeshClass);
-
   size_t totalMeshCount = 0;
 
   while (SizeMap::ByteSizeForClass(_lastMeshClass) < kPageSize) {
@@ -553,20 +534,69 @@ void GlobalHeap::dumpList(int level) {
       }
     }
   }
+  {
+    lock_guard<mutex> lock(_miniheapLock);
+    for (size_t i = 0; i < kNumBins; ++i) {
+      debug("MeshInfo +++++++++++++ GlobalSmallBinCache class:%-2zu, length:%-3zu(%.2f(MB))", i, _cache[i].size(),
+            _cache[i].totalCache() * SizeMap::ByteSizeForClass(i) / 1024.0 / 1024.0);
+    }
+  }
   if (level > 0) {
     lock_guard<mutex> lock(_miniheapLock);
     dumpSpans();
   }
 }
 
+void GlobalHeap::freeCache(int sizeClass, void *head, void *tail, uint32_t size, pid_t current) {
+  if (!size) {
+    return;
+  }
+  GlobalBinCache &cache = _cache[sizeClass];
+  if (cache.push(head, tail, size, current)) {
+    return;
+  }
+  void *tmp{nullptr};
+  while (head) {
+    tmp = *reinterpret_cast<void **>(head);
+    free(head);
+    head = tmp;
+  }
+  maybeMesh();
+}
+
+void GlobalHeap::freeSmallCache() {
+  if (maybeMeshing()) {
+    return;
+  }
+  const auto old = _lastFreeClass.fetch_add(1, std::memory_order::memory_order_seq_cst);
+  const auto sizeClass = old % kNumBins;
+  void *head = nullptr;
+  void *tail = nullptr;
+  uint32_t size = 0;
+  GlobalBinCache &cache = _cache[sizeClass];
+  if (cache.needFree()) {
+    cache.pop_left(head, tail, size);
+  }
+  while (head) {
+    void *tmp = *reinterpret_cast<void **>(head);
+    free(head);
+    head = tmp;
+  }
+  if (size || old % 16 == 0) {
+    maybeMesh();
+  }
+}
+
 namespace method {
 
-void ATTRIBUTE_NEVER_INLINE halfSplit(MWC &prng, MiniHeapListEntry *miniheaps, SplitArray &all, size_t &leftSize,
-                                      size_t &rightSize) noexcept {
+void ATTRIBUTE_NEVER_INLINE halfSplit(MWC &prng, size_t sizeClass, MiniHeapListEntry *miniheaps, SplitArray &all,
+                                      size_t &leftSize, size_t &rightSize) noexcept {
   d_assert(leftSize == 0);
   d_assert(rightSize == 0);
 
   size_t allSize = 0;
+  size_t fullness = std::min(SizeMap::ObjectCountForClass(sizeClass), 64ul);
+  fullness = fullness * kOccupancyCutoff;
 
   MiniHeapID mhId = miniheaps->next();
   while (mhId != list::Head && allSize < kMaxSplitListSize * 2) {
@@ -574,7 +604,7 @@ void ATTRIBUTE_NEVER_INLINE halfSplit(MWC &prng, MiniHeapListEntry *miniheaps, S
     mhId = mh->getFreelist()->next();
 
     d_assert(mh->isMeshingCandidate());
-    if (mh->fullness() >= kOccupancyCutoff) {
+    if (mh->inUseCount1() >= fullness) {
       continue;
     }
 
@@ -589,7 +619,7 @@ void ATTRIBUTE_NEVER_INLINE halfSplit(MWC &prng, MiniHeapListEntry *miniheaps, S
 }
 
 void ATTRIBUTE_NEVER_INLINE
-shiftedSplitting(MWC &prng, MiniHeapListEntry *miniheaps, SplitArray &all,
+shiftedSplitting(MWC &prng, size_t sizeClass, MiniHeapListEntry *miniheaps, SplitArray &all,
                  const function<bool(std::pair<MiniHeap *, MiniHeap *> &&)> &meshFound) noexcept {
   constexpr size_t t = 64;
 
@@ -603,7 +633,7 @@ shiftedSplitting(MWC &prng, MiniHeapListEntry *miniheaps, SplitArray &all,
   size_t leftSize = 0;
   size_t rightSize = 0;
 
-  halfSplit(prng, miniheaps, all, leftSize, rightSize);
+  halfSplit(prng, sizeClass, miniheaps, all, leftSize, rightSize);
 
   left = &all[0];
   right = left + leftSize;

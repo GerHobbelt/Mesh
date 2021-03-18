@@ -72,6 +72,9 @@ static constexpr int kMapShared = 1;
 static constexpr int kMapShared = kMeshingEnabled ? MAP_SHARED : MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
 #endif
 
+static constexpr size_t kPtrOffset = 48;
+static constexpr size_t kPtrMask = (static_cast<size_t>(-1)) >> (64 - kPtrOffset);
+
 static constexpr size_t kMinObjectSize = 16;
 static constexpr size_t kMaxSize = 16384;
 static constexpr size_t kClassSizesMax = 37;
@@ -120,6 +123,9 @@ static constexpr int16_t kMaxShuffleVectorLength = 256;  // sizeof(uint8_t) << 8
 static constexpr bool kEnableShuffleOnInit = SHUFFLE_ON_INIT == 1;
 static constexpr bool kEnableShuffleOnFree = SHUFFLE_ON_FREE == 1;
 
+static constexpr size_t kMinGlobalVectorCacheLength = 8;
+static constexpr size_t kMaxGlobalVectorCacheLength = 32;
+
 // madvise(DONTDUMP) the heap to make reasonable coredumps
 static constexpr bool kAdviseDump = true;
 
@@ -134,7 +140,7 @@ static constexpr size_t kMaxMeshes = 256;  // 1 per bit
 #ifdef __APPLE__
 static constexpr size_t kArenaSize = 32ULL * 1024ULL * 1024ULL * 1024ULL;  // 32 GB
 #else
-static constexpr size_t kArenaSize = 24ULL * 1024ULL * 1024ULL * 1024ULL;  // 24 GB
+static constexpr size_t kArenaSize = 64ULL * 1024ULL * 1024ULL * 1024ULL;  // 24 GB
 #endif
 static constexpr size_t kAltStackSize = 16 * 1024UL;  // 16k sigaltstacks
 #define SIGQUIESCE (SIGRTMIN + 7)
@@ -430,6 +436,10 @@ public:
   // static inline int32_t ATTRIBUTE_ALWAYS_INLINE ByteSizeForClass(uint32_t cl) {
   static inline size_t ATTRIBUTE_ALWAYS_INLINE ByteSizeForClass(int32_t cl) {
     return class_to_size_[static_cast<uint32_t>(cl)];
+  }
+
+  static inline size_t ObjectCountForClass(int32_t cl) {
+    return SizeClassToPageCount(cl) * kPageSize / ByteSizeForClass(cl);
   }
 
   // Mapping from size class to max size storable in that class

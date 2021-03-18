@@ -44,7 +44,7 @@ void ThreadLocalHeap::InitTLH() {
 ThreadLocalHeap *ThreadLocalHeap::NewHeap(pthread_t current) {
   // we just allocate out of our internal heap
   void *buf = mesh::internal::Heap().malloc(sizeof(ThreadLocalHeap));
-  static_assert(sizeof(ThreadLocalHeap) < 4096 * 16, "tlh should have a reasonable size");
+  static_assert(sizeof(ThreadLocalHeap) < 4096 * 32, "tlh should have a reasonable size");
   hard_assert(buf != nullptr);
   hard_assert(reinterpret_cast<uintptr_t>(buf) % CACHELINE_SIZE == 0);
 
@@ -112,14 +112,17 @@ void ThreadLocalHeap::DeleteHeap(ThreadLocalHeap *heap) {
   // manually invoke the destructor
   heap->ThreadLocalHeap::~ThreadLocalHeap();
 
-  if (heap->_next != nullptr) {
-    heap->_next->_prev = heap->_prev;
-  }
-  if (heap->_prev != nullptr) {
-    heap->_prev->_next = heap->_next;
-  }
-  if (_threadLocalHeaps == heap) {
-    _threadLocalHeaps = heap->_next;
+  {
+    std::lock_guard<GlobalHeap> lock(mesh::runtime().heap());
+    if (heap->_next != nullptr) {
+      heap->_next->_prev = heap->_prev;
+    }
+    if (heap->_prev != nullptr) {
+      heap->_prev->_next = heap->_next;
+    }
+    if (_threadLocalHeaps == heap) {
+      _threadLocalHeaps = heap->_next;
+    }
   }
 
   mesh::internal::Heap().free(reinterpret_cast<void *>(heap));
@@ -127,37 +130,49 @@ void ThreadLocalHeap::DeleteHeap(ThreadLocalHeap *heap) {
 
 void ThreadLocalHeap::releaseAll() {
   for (size_t i = 1; i < kNumBins; i++) {
-    _shuffleVector[i].refillMiniheaps();
-    _global->releaseMiniheaps(_shuffleVector[i].miniheaps());
+    ShuffleCache &shuffleCache = _shuffleCache[i];
+    void *head, *tail;
+    uint32_t size = shuffleCache.pop_list(shuffleCache.length(), &head, &tail);
+    d_assert(shuffleCache.isExhausted());
+    d_assert(!shuffleCache.length());
+    _global->freeCache(i, head, tail, size, _current);
   }
+}
+
+void CACHELINE_ALIGNED_FN ThreadLocalHeap::releaseToCenter(size_t sizeClass) {
+  if (unlikely(_global->maybeMeshing())) {
+    return;
+  }
+  ShuffleCache &shuffleCache = _shuffleCache[sizeClass];
+  void *head, *tail;
+  uint32_t size = shuffleCache.pop_list(shuffleCache.maxCount() / 3, &head, &tail);
+  if (size) {
+    _global->freeCache(sizeClass, head, tail, size, _current);
+    _freeCount = 0;
+  }
+}
+
+void CACHELINE_ALIGNED_FN ThreadLocalHeap::releaseToCenter() {
+  _global->freeSmallCache();
+  _freeCount = 0;
 }
 
 // we get here if the shuffleVector is exhausted
 void *CACHELINE_ALIGNED_FN ThreadLocalHeap::smallAllocSlowpath(size_t sizeClass) {
-  ShuffleVector &shuffleVector = _shuffleVector[sizeClass];
-
-  // we grab multiple MiniHeaps at a time from the global heap.  often
-  // it is possible to refill the freelist from a not-yet-used
-  // MiniHeap we already have, without global cross-thread
-  // synchronization
-  if (likely(shuffleVector.localRefill())) {
-    return shuffleVector.malloc();
+  ShuffleCache &shuffleCache = _shuffleCache[sizeClass];
+  void *head, *tail;
+  uint32_t size;
+  mesh::MiniHeapArray miniheaps{};
+  if (_global->allocCache(sizeClass, head, tail, size, miniheaps, _current)) {
+    shuffleCache.push_list(head, tail, size);
+    return shuffleCache.malloc();
+  } else {
+    ShuffleVector &shuffleVector = _shuffleVector[sizeClass];
+    shuffleCache.setMaxCount(shuffleVector.maxCount());
+    shuffleVector.reinit(miniheaps);
+    _global->releaseMiniheaps(sizeClass, miniheaps);
+    return shuffleCache.malloc();
   }
-
-  return smallAllocGlobalRefill(shuffleVector, sizeClass);
 }
 
-void *CACHELINE_ALIGNED_FN ThreadLocalHeap::smallAllocGlobalRefill(ShuffleVector &shuffleVector, size_t sizeClass) {
-  const size_t sizeMax = SizeMap::ByteSizeForClass(sizeClass);
-
-  _global->allocSmallMiniheaps(sizeClass, sizeMax, shuffleVector.miniheaps(), _current);
-  shuffleVector.reinit();
-
-  d_assert(!shuffleVector.isExhausted());
-
-  void *ptr = shuffleVector.malloc();
-  d_assert(ptr != nullptr);
-
-  return ptr;
-}
 }  // namespace mesh

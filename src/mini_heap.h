@@ -33,9 +33,9 @@ private:
   }
   static constexpr uint32_t SizeClassShift = 0;
   static constexpr uint32_t FreelistIdShift = 6;
-  static constexpr uint32_t ShuffleVectorOffsetShift = 8;
-  static constexpr uint32_t MaxCountShift = 16;
-  static constexpr uint32_t EpochShift = 25;
+  // static constexpr uint32_t ShuffleVectorOffsetShift = 8;
+  static constexpr uint32_t MaxCountShift = 8;
+  static constexpr uint32_t EpochShift = 17;
   static constexpr uint32_t MeshedOffset = 30;
   static constexpr uint32_t PartialFreeOffset = 31;
 
@@ -50,12 +50,12 @@ private:
   }
 
 public:
-  explicit Flags(uint32_t maxCount, uint32_t sizeClass, uint32_t svOffset, uint32_t freelistId) noexcept
-      : _flags{(maxCount << MaxCountShift) + (sizeClass << SizeClassShift) + (svOffset << ShuffleVectorOffsetShift) +
-               (freelistId << FreelistIdShift) + (((_flags >> EpochShift) & 0x1f) << EpochShift)} {
+  explicit Flags(uint32_t maxCount, uint32_t sizeClass, uint32_t freelistId) noexcept
+      : _flags{(maxCount << MaxCountShift) + (sizeClass << SizeClassShift) + (freelistId << FreelistIdShift) +
+               (((_flags >> EpochShift) & 0x1f) << EpochShift)} {
     d_assert((freelistId & 0x3) == freelistId);
     d_assert((sizeClass & ((1 << FreelistIdShift) - 1)) == sizeClass);
-    d_assert(svOffset < 255);
+    // d_assert(svOffset < 255);
     d_assert_msg(sizeClass < 255, "sizeClass: %u", sizeClass);
     d_assert(maxCount <= 256);
     d_assert(this->maxCount() == maxCount);
@@ -80,17 +80,6 @@ public:
 
   inline uint32_t sizeClass() const {
     return (_flags.load(std::memory_order_seq_cst) >> SizeClassShift) & 0x3f;
-  }
-
-  inline uint8_t svOffset() const {
-    return (_flags.load(std::memory_order_seq_cst) >> ShuffleVectorOffsetShift) & 0xff;
-  }
-
-  inline void setSvOffset(uint8_t off) {
-    d_assert(off < 255);
-    uint32_t mask = ~(static_cast<uint32_t>(0xff) << ShuffleVectorOffsetShift);
-    uint32_t newVal = (static_cast<uint32_t>(off) << ShuffleVectorOffsetShift);
-    setMasked(mask, newVal);
   }
 
   inline uint32_t createEpoch() const {
@@ -169,7 +158,7 @@ public:
   MiniHeap(void *arenaBegin, Span span, size_t objectCount, size_t objectSize)
       : _bitmap(objectCount),
         _span(span),
-        _flags(objectCount, objectCount > 1 ? SizeMap::SizeClass(objectSize) : kClassSizesMax, 0, list::Attached),
+        _flags(objectCount, objectCount > 1 ? SizeMap::SizeClass(objectSize) : kClassSizesMax, list::Attached),
         _objectSizeReciprocal(1.0 / (float)objectSize) {
     // debug("sizeof(MiniHeap): %zu", sizeof(MiniHeap));
 
@@ -229,7 +218,7 @@ public:
   }
 
   inline void ATTRIBUTE_ALWAYS_INLINE freeOff(size_t off) {
-    d_assert_msg(_bitmap.isSet(off), "MiniHeap(%p) expected bit %zu to be set (svOff:%zu)", this, off, svOffset());
+    d_assert_msg(_bitmap.isSet(off), "MiniHeap(%p) expected bit %zu to be set", this, off);
     _bitmap.unset(off);
   }
 
@@ -321,6 +310,10 @@ public:
     return _bitmap.inUseCount();
   }
 
+  inline uint32_t ATTRIBUTE_ALWAYS_INLINE inUseCount1() const {
+    return _bitmap.inUseCount1();
+  }
+
   inline bool isMeshedFull() const {
     return _bitmap.inUseCount() == _bitmap.bitCount();
   }
@@ -341,15 +334,6 @@ public:
       _freelist.remove(listHead);
     }
     this->setFreelistId(list::Attached);
-  }
-
-  inline uint8_t svOffset() const {
-    return _flags.svOffset();
-  }
-
-  inline void setSvOffset(uint8_t off) {
-    // debug("MiniHeap(%p) SET svOff:%zu)", this, off);
-    _flags.setSvOffset(off);
   }
 
   inline uint8_t freelistId() const {
@@ -555,12 +539,12 @@ protected:
   MiniHeapID _nextMeshed{};           // 4        64
 };
 
-typedef FixedArray<MiniHeap, 63> MiniHeapArray;
+typedef FixedArray<MiniHeap, 63> MiniHeapArray2;
 
 static_assert(sizeof(pid_t) == 4, "pid_t not 32-bits!");
 static_assert(sizeof(mesh::internal::Bitmap) == 32, "Bitmap too big!");
 static_assert(sizeof(MiniHeap) == 64, "MiniHeap too big!");
-static_assert(sizeof(MiniHeapArray) == 64 * sizeof(void *), "MiniHeapArray too big!");
+static_assert(sizeof(MiniHeapArray2) == 64 * sizeof(void *), "MiniHeapArray too big!");
 }  // namespace mesh
 
 #endif  // MESH_MINI_HEAP_H

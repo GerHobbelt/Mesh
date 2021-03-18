@@ -329,6 +329,8 @@ typedef std::basic_string<char, std::char_traits<char>, STLAllocator<char, Heap>
 template <typename T>
 using vector = std::vector<T, STLAllocator<T, Heap>>;
 
+using SpinLockType = HL::SpinLockType;
+
 // https://stackoverflow.com/questions/529831/returning-the-greatest-key-strictly-less-than-the-given-key-in-a-c-map
 template <typename Map>
 typename Map::const_iterator greatest_leq(Map const &m, typename Map::key_type const &k) {
@@ -372,6 +374,7 @@ public:
     UNMAP_PAGE,
     CLEAN_PAGE,
     FLUSH,
+    FLUSH_ALL,
   };
 
   FreeCmd(CmdType command) : cmd(command) {

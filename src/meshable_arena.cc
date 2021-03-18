@@ -51,7 +51,9 @@ MeshableArena::MeshableArena() : SuperHeap(), _fastPrng(internal::seed(), intern
   }
   _fd = fd;
   _arenaBegin = SuperHeap::map(kArenaSize, kMapShared, fd);
-  _mhIndex = reinterpret_cast<atomic<MiniHeapID> *>(SuperHeap::thp_malloc(indexSize()));
+  _arenaEnd = reinterpret_cast<void *>((char *)(_arenaBegin) + kArenaSize);
+
+  _mhIndex = reinterpret_cast<atomic<size_t> *>(SuperHeap::malloc(indexSize()));
 
   hard_assert(_arenaBegin != nullptr);
   hard_assert(_mhIndex != nullptr);
@@ -307,7 +309,7 @@ Span MeshableArena::reservePages(const size_t pageCount, const size_t pageAlignm
   Span result(0, 0);
   auto ok = findPages(pageCount, result, flags);
   if (!ok) {
-    tryAndSendToFree(new internal::FreeCmd(internal::FreeCmd::FLUSH));
+    tryAndSendToFree(new internal::FreeCmd(internal::FreeCmd::FLUSH_ALL));
     getSpansFromBg(true);
     ok = findPages(pageCount, result, flags);
     if (!ok) {
@@ -399,7 +401,7 @@ char *MeshableArena::pageAlloc(Span &result, size_t pageCount, size_t pageAlignm
 
   d_assert(contains(ptrFromOffset(span.offset)));
 #ifndef NDEBUG
-  if (_mhIndex[span.offset].load().hasValue()) {
+  if (_mhIndex[span.offset].load()) {
     mesh::debug("----\n");
     auto mh = reinterpret_cast<MiniHeap *>(miniheapForArenaOffset(span.offset));
     mh->dumpDebug();
@@ -463,11 +465,12 @@ struct {
 } customLess;
 
 void MeshableArena::getSpansFromBg(bool wait) {
-  bool needSort = false;
-  bool gotOne = false;
+  bool gotFlushAll = false;
 
   constexpr unsigned int spin_loops = 16u, spins = 16u;
   unsigned int loop_count = 0;
+
+  auto last_spans_size = _clean[kSpanClassCount - 1].size();
 
   while (true) {
     size_t pageCount = 0;
@@ -477,7 +480,7 @@ void MeshableArena::getSpansFromBg(bool wait) {
     if (preCommand) {
       // debug("getSpansFromBg = %d\n", preDirtySpans->size());
       // all add to the mark spans
-      if (preCommand->cmd == internal::FreeCmd::FLUSH) {
+      if (preCommand->cmd == internal::FreeCmd::FLUSH || preCommand->cmd == internal::FreeCmd::FLUSH_ALL) {
         for (auto &s : preCommand->spans) {
 #ifndef NDEBUG
           if (_isCOWRunning && !wait) {
@@ -490,17 +493,16 @@ void MeshableArena::getSpansFromBg(bool wait) {
           pageCount += s.length;
         }
 
-        if (preCommand->spans.size() > 0) {
-          needSort = true;
+        if (preCommand->cmd == internal::FreeCmd::FLUSH_ALL) {
+          gotFlushAll = true;
         }
-        gotOne = true;
       } else {
         hard_assert(false);
       }
       // debug("getSpansFromBg got %d spans -  %d page from backgroud.\n", preCommand->spans.size(), pageCount);
       delete preCommand;
     } else {
-      if (wait && !gotOne && runtime().freeThreadRunning()) {
+      if (wait && !gotFlushAll && runtime().freeThreadRunning()) {
         if (loop_count < spin_loops) {
           for (unsigned int j = 0; j < spins; ++j) {
             cpupause();
@@ -515,7 +517,7 @@ void MeshableArena::getSpansFromBg(bool wait) {
     }
   }
 
-  if (needSort) {
+  if (last_spans_size != _clean[kSpanClassCount - 1].size()) {
     ska_sort(_clean[kSpanClassCount - 1].begin(), _clean[kSpanClassCount - 1].end(),
              [](auto &&span) -> decltype(auto) { return -span.length; });
   }
@@ -792,7 +794,7 @@ void MeshableArena::prepareForFork() {
     moveRemainPages();
   }
 
-  tryAndSendToFree(new internal::FreeCmd(internal::FreeCmd::FLUSH));
+  tryAndSendToFree(new internal::FreeCmd(internal::FreeCmd::FLUSH_ALL));
   getSpansFromBg(true);
 
   internal::Heap().lock();
@@ -834,7 +836,7 @@ void MeshableArena::afterForkParentAndChild() {
     madvise(address, address_size, MADV_DONTDUMP);
   }
 
-  tryAndSendToFree(new internal::FreeCmd(internal::FreeCmd::FLUSH));
+  tryAndSendToFree(new internal::FreeCmd(internal::FreeCmd::FLUSH_ALL));
   getSpansFromBg(true);
 
   // remap all the clean spans
@@ -992,11 +994,13 @@ void MeshableArena::moveRemainPages() {
         for (auto i = off; i < mh->span().length; ++i) {
           d_assert(_cowBitmap.isSet(off));
         }
-#endif
+
         MiniHeap *leader_mh = mh->meshedLeader();
         d_assert_msg(mh->span().offset <= off && off < mh->span().offset + mh->span().length,
                      "mh->span(%u, %u)  off=%u  leader=%p", mh->span().offset, mh->span().length, off, leader_mh);
-        off += mh->span().length;
+        d_assert(mh->span().offset + mh->span().length > off);
+#endif
+        off = mh->span().offset + mh->span().length;
       } else {
         ++off;
       }
@@ -1008,53 +1012,7 @@ void MeshableArena::moveRemainPages() {
         d_assert(off == mh->span().offset || off == mh->meshedLeader()->span().offset);
         off += mh->span().length;
       } else {
-        tryAndSendToFree(new internal::FreeCmd(internal::FreeCmd::FLUSH));
-        getSpansFromBg(true);
-
-        bool found = false;
-        Offset slen = 0;
-        for (size_t i = 0; i < kSpanClassCount; ++i) {
-          for (auto &span : _clean[i]) {
-            if (span.offset == off) {
-              found = true;
-              slen = span.length;
-              trackCOWed(span);
-              resetSpanMapping(span);
-#ifndef NDEBUG
-              debug("found in _clean len=%u", slen);
-#endif
-            }
-          }
-        }
-
-        for (size_t i = 0; i < kSpanClassCount; ++i) {
-          for (auto &span : _dirty[i]) {
-            if (span.offset == off) {
-              found = true;
-              slen = span.length;
-              trackCOWed(span);
-              resetSpanMapping(span);
-#ifndef NDEBUG
-              debug("found in _dirty len=%u", slen);
-#endif
-            }
-          }
-        }
-
-        for (auto &span : _toReset) {
-          if (span.offset == off) {
-            found = true;
-            slen = span.length;
-            trackCOWed(span);
-            resetSpanMapping(span);
-#ifndef NDEBUG
-            debug("found in _toReset len=%u", slen);
-#endif
-          }
-        }
-        d_assert(found);
-
-        off += slen;
+        hard_assert(false);
       }
       continue;
     }
@@ -1067,7 +1025,7 @@ void MeshableArena::moveRemainPages() {
     debug("moveRemainPages finished < %u, %u, %u", off, _COWend, _end);
     for (size_t j = 0; j < _COWend; ++j) {
       if (!_cowBitmap.isSet(j)) {
-        tryAndSendToFree(new internal::FreeCmd(internal::FreeCmd::FLUSH));
+        tryAndSendToFree(new internal::FreeCmd(internal::FreeCmd::FLUSH_ALL));
         getSpansFromBg(true);
 
         bool found = false;

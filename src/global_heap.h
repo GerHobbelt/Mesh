@@ -67,6 +67,105 @@ public:
   size_t mhHighWaterMark;
 };
 
+class GlobalBinCache {
+public:
+  GlobalBinCache() {
+  }
+  void init() {
+    _readIndex = _writeIndex = 0;
+  }
+
+  size_t totalCache() const {
+    size_t sum = 0;
+    for (uint32_t i = _readIndex; i < _writeIndex; ++i) {
+      sum += _cache[i % kMaxGlobalVectorCacheLength].size;
+    }
+    return sum;
+  }
+
+  inline uint32_t size() const {
+    lock_guard<internal::SpinLockType> lock(_lock);
+    return _writeIndex - _readIndex;
+  }
+
+  inline uint32_t sizeNoLock() const {
+    return _writeIndex - _readIndex;
+  }
+
+  inline bool needFree() const {
+    return size() > kMinGlobalVectorCacheLength;
+  }
+
+  inline bool full() const {
+    return size() >= kMaxGlobalVectorCacheLength;
+  }
+  inline bool empty() const {
+    lock_guard<internal::SpinLockType> lock(_lock);
+    return _readIndex == _writeIndex;
+  }
+
+  bool push(void *head, void *tail, uint32_t size, pid_t current) {
+    lock_guard<internal::SpinLockType> lock(_lock);
+    if (sizeNoLock() >= kMaxGlobalVectorCacheLength) {
+      return false;
+    }
+    const auto writeIndex = _writeIndex % kMaxGlobalVectorCacheLength;
+    ++_writeIndex;
+    BinCache &cache = _cache[writeIndex];
+    cache.head = head;
+    cache.tail = tail;
+    cache.size = size;
+    cache.thread = current;
+    return true;
+  }
+
+  bool pop(void *&head, void *&tail, uint32_t &size) {
+    lock_guard<internal::SpinLockType> lock(_lock);
+    if (_readIndex == _writeIndex) {
+      return false;
+    }
+    d_assert(_writeIndex > _readIndex);
+    --_writeIndex;
+    const auto popIndex = _writeIndex % kMaxGlobalVectorCacheLength;
+    BinCache &cache = _cache[popIndex];
+    head = cache.head;
+    tail = cache.tail;
+    size = cache.size;
+    return true;
+  }
+
+  bool pop_left(void *&head, void *&tail, uint32_t &size) {
+    lock_guard<internal::SpinLockType> lock(_lock);
+    if (_readIndex == _writeIndex) {
+      return false;
+    }
+    d_assert(_writeIndex > _readIndex);
+    const auto popIndex = _readIndex % kMaxGlobalVectorCacheLength;
+    ++_readIndex;
+    if (_readIndex >= kMaxGlobalVectorCacheLength) {
+      _readIndex -= kMaxGlobalVectorCacheLength;
+      _writeIndex -= kMaxGlobalVectorCacheLength;
+    }
+    BinCache &cache = _cache[popIndex];
+    head = cache.head;
+    tail = cache.tail;
+    size = cache.size;
+    return true;
+  }
+
+private:
+  struct BinCache {
+    void *head;
+    void *tail;
+    uint32_t size;
+    pid_t thread;
+  };
+  BinCache _cache[kMaxGlobalVectorCacheLength];
+  uint32_t _readIndex{0};
+  uint32_t _writeIndex{0};
+  mutable internal::SpinLockType _lock{};
+} CACHELINE_ALIGNED;
+
 class GlobalHeap : public MeshableArena {
 private:
   DISALLOW_COPY_AND_ASSIGN(GlobalHeap);
@@ -79,6 +178,13 @@ public:
   enum { Alignment = 16 };
 
   GlobalHeap() : Super(), _maxObjectSize(SizeMap::ByteSizeForClass(kNumBins - 1)), _lastMesh{time::now()} {
+    for (int i = 0; i < kNumBins; ++i) {
+      _cache[i].init();
+    }
+  }
+
+  inline bool maybeMeshing() const {
+    return _meshEpoch.current() % 2 == 1;
   }
 
   inline void dumpStrings() const {
@@ -105,7 +211,7 @@ public:
   void dumpStats(int level, bool beDetailed) const;
 
   // must be called with exclusive _mhRWLock held
-  inline MiniHeap *ATTRIBUTE_ALWAYS_INLINE allocMiniheapLocked(int sizeClass, size_t pageCount, size_t objectCount,
+  inline MiniHeap *ATTRIBUTE_ALWAYS_INLINE allocMiniheapLocked(size_t sizeClass, size_t pageCount, size_t objectCount,
                                                                size_t objectSize, size_t pageAlignment = 1) {
     d_assert(0 < pageCount);
 
@@ -120,8 +226,7 @@ public:
 
     MiniHeap *mh = new (buf) MiniHeap(arenaBegin(), span, objectCount, objectSize);
 
-    const auto miniheapID = MiniHeapID{_mhAllocator.offsetFor(buf)};
-    Super::trackMiniHeap(span, miniheapID);
+    Super::trackMiniHeap(span, mh, sizeClass);
 
     // mesh::debug("%p (%u) created!\n", mh, GetMiniHeapID(mh));
 
@@ -142,7 +247,7 @@ public:
 
     lock_guard<mutex> lock(_miniheapLock);
 
-    MiniHeap *mh = allocMiniheapLocked(-1, pageCount, 1, pageCount * kPageSize, pageAlignment);
+    MiniHeap *mh = allocMiniheapLocked(kClassSizesMax, pageCount, 1, pageCount * kPageSize, pageAlignment);
 
     d_assert(mh->isLargeAlloc());
     d_assert(mh->spanSize() == pageCount * kPageSize);
@@ -224,27 +329,29 @@ public:
   }
 
   template <uint32_t Size>
-  inline void releaseMiniheaps(FixedArray<MiniHeap, Size> &miniheaps) {
+  inline void releaseMiniheaps(size_t sizeClass, FixedArray<MiniHeap, Size> &miniheaps) {
     if (miniheaps.size() == 0) {
       return;
     }
 
     lock_guard<mutex> lock(_miniheapLock);
     for (auto mh : miniheaps) {
-      releaseMiniheapLocked(mh, mh->sizeClass());
+      releaseMiniheapLocked(mh, sizeClass);
     }
     miniheaps.clear();
   }
 
   template <uint32_t Size>
-  ssize_t fillFromList(FixedArray<MiniHeap, Size> &miniheaps, pid_t current,
-                       std::pair<MiniHeapListEntry, size_t> &freelist, ssize_t numToMove) {
+  void fillFromList(FixedArray<MiniHeap, Size> &miniheaps, pid_t current,
+                    std::pair<MiniHeapListEntry, size_t> &freelist, uint32_t maxSize) {
     if (freelist.first.empty()) {
-      return numToMove;
+      return;
     }
 
+    d_assert(maxSize <= Size);
+
     auto nextId = freelist.first.next();
-    while (nextId != list::Head && numToMove > 0 && !miniheaps.full()) {
+    while (nextId != list::Head && miniheaps.size() < maxSize) {
       auto mh = GetMiniHeap(nextId);
       d_assert(mh != nullptr);
       nextId = mh->getFreelist()->next();
@@ -259,45 +366,56 @@ public:
       // TODO: this is commented out to match a bug in the previous implementation;
       // it turns out if you don't track bytes free and give more memory to the
       // thread-local cache, things perform better!
-      // bytesFree += mh->bytesFree();
-      numToMove -= mh->maxCount() - mh->inUseCount();
       d_assert(!mh->isAttached());
       mh->setAttached(current, &freelist.first);
       d_assert(mh->isAttached() && mh->current() == current);
-      hard_assert(!miniheaps.full());
       miniheaps.append(mh);
       d_assert(freelist.second > 0);
       freelist.second--;
     }
 
-    return numToMove;
+    return;
   }
 
   template <uint32_t Size>
-  ssize_t selectForReuse(int sizeClass, FixedArray<MiniHeap, Size> &miniheaps, pid_t current, ssize_t numToMove) {
-    numToMove = fillFromList(miniheaps, current, _partialFreelist[sizeClass], numToMove);
+  void selectForReuse(int sizeClass, FixedArray<MiniHeap, Size> &miniheaps, pid_t current) {
+    fillFromList(miniheaps, current, _partialFreelist[sizeClass], Size);
 
-    if (numToMove <= 0 || miniheaps.full()) {
-      return numToMove;
+    if (miniheaps.size() >= 2 || miniheaps.full()) {
+      return;
     }
 
     // we've exhausted all of our partially full MiniHeaps, but there
     // might still be empty ones we could reuse.
-    return fillFromList(miniheaps, current, _emptyFreelist[sizeClass], numToMove);
+    fillFromList(miniheaps, current, _emptyFreelist[sizeClass], miniheaps.size() + 1);
   }
+
+  template <uint32_t Size>
+  bool allocCache(int sizeClass, void *&head, void *&tail, uint32_t &size, FixedArray<MiniHeap, Size> &miniheaps,
+                  pid_t current) {
+    GlobalBinCache &cache = _cache[sizeClass];
+    if (cache.pop(head, tail, size)) {
+      return true;
+    } else {
+      lock_guard<mutex> lock(_miniheapLock);
+      uint32_t objectSize = SizeMap::ByteSizeForClass(sizeClass);
+      allocSmallMiniheapsLocked(sizeClass, objectSize, miniheaps, current);
+      return false;
+    }
+  }
+  void freeCache(int sizeClass, void *head, void *tail, uint32_t size, pid_t current);
+  void freeSmallCache();
 
   template <uint32_t Size>
   inline void allocSmallMiniheaps(int sizeClass, uint32_t objectSize, FixedArray<MiniHeap, Size> &miniheaps,
                                   pid_t current) {
     lock_guard<mutex> lock(_miniheapLock);
+    allocSmallMiniheapsLocked(sizeClass, objectSize, miniheaps, current);
+  }
 
-    d_assert(sizeClass >= 0);
-
-    for (MiniHeap *oldMH : miniheaps) {
-      releaseMiniheapLocked(oldMH, sizeClass);
-    }
-    miniheaps.clear();
-
+  template <uint32_t Size>
+  inline void allocSmallMiniheapsLocked(int sizeClass, uint32_t objectSize, FixedArray<MiniHeap, Size> &miniheaps,
+                                        pid_t current) {
     d_assert(objectSize <= _maxObjectSize);
 
 #ifndef NDEBUG
@@ -308,16 +426,11 @@ public:
 #endif
     d_assert(sizeClass >= 0);
     d_assert(sizeClass < kNumBins);
-
     d_assert(miniheaps.size() == 0);
-    ssize_t numToMove = kMiniheapRefillGoalSize / objectSize;
-    if (numToMove < 2) {
-      numToMove = 2;
-    }
 
     // check our bins for a miniheap to reuse
-    numToMove = selectForReuse(sizeClass, miniheaps, current, numToMove);
-    if (numToMove <= 0 || miniheaps.full()) {
+    selectForReuse(sizeClass, miniheaps, current);
+    if (miniheaps.size() >= 2) {
       return;
     }
 
@@ -328,14 +441,11 @@ public:
     const size_t pageCount = static_cast<size_t>(SizeMap::SizeClassToPageCount(sizeClass));
     const size_t objectCount = pageCount * kPageSize / objectSize;
 
-    while (numToMove > 0 && !miniheaps.full()) {
-      auto mh = allocMiniheapLocked(sizeClass, pageCount, objectCount, objectSize);
-      d_assert(!mh->isAttached());
-      mh->setAttached(current, nullptr);
-      d_assert(mh->isAttached() && mh->current() == current);
-      miniheaps.append(mh);
-      numToMove -= objectCount;
-    }
+    auto mh = allocMiniheapLocked(sizeClass, pageCount, objectCount, objectSize);
+    d_assert(!mh->isAttached());
+    mh->setAttached(current, nullptr);
+    d_assert(mh->isAttached() && mh->current() == current);
+    miniheaps.append(mh);
 
     return;
   }
@@ -612,17 +722,19 @@ private:
       Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head};
 
   mutable mutex _miniheapLock{};
-
   GlobalHeapStats _stats{};
 
   // XXX: should be atomic, but has exception spec?
   time::time_point _lastMesh;
   size_t _lastMeshClass{0};
+
+  GlobalBinCache _cache[kNumBins];
+  atomic_size_t _lastFreeClass{0};
 };
 
 static_assert(kNumBins == 37, "if this changes, add more 'Head's above");
 static_assert(sizeof(std::array<MiniHeapListEntry, kNumBins>) == kNumBins * 8, "list size is right");
-static_assert(sizeof(GlobalHeap) < (kNumBins * 8 * 3 + 64 * 7 + 100000), "gh small enough");
+static_assert(sizeof(GlobalHeap) < (kNumBins * 8 * 3 + 64 * 7 + 100000000), "gh small enough");
 }  // namespace mesh
 
 #endif  // MESH_GLOBAL_HEAP_H
