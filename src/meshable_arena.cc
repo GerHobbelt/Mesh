@@ -794,8 +794,8 @@ void MeshableArena::prepareForFork() {
     moveRemainPages();
   }
 
-  tryAndSendToFree(new internal::FreeCmd(internal::FreeCmd::FLUSH_ALL));
-  getSpansFromBg(true);
+  // tryAndSendToFree(new internal::FreeCmd(internal::FreeCmd::FLUSH_ALL));
+  // getSpansFromBg(true);
 
   internal::Heap().lock();
 
