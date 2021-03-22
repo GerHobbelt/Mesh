@@ -93,7 +93,7 @@ inline void change_thread_name(const char *, int = -1) {
 ssize_t internal::copyFile(int dstFd, int srcFd, off_t off, size_t sz) {
   d_assert(off >= 0);
 
-  off_t newOff = lseek(dstFd, off, SEEK_SET);
+  off_t __attribute__((__unused__)) newOff = lseek(dstFd, off, SEEK_SET);
   d_assert(newOff == off);
 
 #if defined(__APPLE__) || defined(__FreeBSD__)

@@ -164,7 +164,7 @@ public:
 
     d_assert(_bitmap.inUseCount() == 0);
 
-    const auto expectedSpanSize = _span.byteLength();
+    const auto __attribute__((__unused__)) expectedSpanSize = _span.byteLength();
     d_assert_msg(expectedSpanSize == spanSize(), "span size %zu == %zu (%u, %u)", expectedSpanSize, spanSize(),
                  maxCount(), this->objectSize());
 

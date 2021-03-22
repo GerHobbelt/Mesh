@@ -212,7 +212,7 @@ public:
 
     // allocate out of the arena
     Span span{0, 0};
-    char *spanBegin = Super::pageAlloc(span, pageCount, pageAlignment);
+    char *__attribute__((__unused__)) spanBegin = Super::pageAlloc(span, pageCount, pageAlignment);
     d_assert(spanBegin != nullptr);
     d_assert((reinterpret_cast<uintptr_t>(spanBegin) / kPageSize) % pageAlignment == 0);
 

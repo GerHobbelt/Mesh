@@ -144,7 +144,7 @@ public:
 
   // add calls remove for you
   void add(Entry *listHead, uint8_t listId, ID selfId, Object *newEntry) {
-    const uint8_t oldId = newEntry->freelistId();
+    const uint8_t __attribute__((__unused__)) oldId = newEntry->freelistId();
     d_assert(oldId != listId);
     d_assert(!newEntry->isLargeAlloc());
 

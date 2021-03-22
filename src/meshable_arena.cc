@@ -193,7 +193,7 @@ bool MeshableArena::findPagesInner(internal::vector<Span> freeSpans[kSpanClassCo
   if (spanList.empty())
     return false;
 
-  size_t oldLen = spanList.size();
+  size_t __attribute__((__unused__)) oldLen = spanList.size();
 
   if (i == kSpanClassCount - 1) {
     // the final span class contains (and is the only class to
@@ -665,7 +665,7 @@ void MeshableArena::freePhys(void *ptr, size_t sz) {
 
   const off_t off = reinterpret_cast<char *>(ptr) - reinterpret_cast<char *>(_arenaBegin);
 #ifndef __APPLE__
-  int result = fallocate(_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, off, sz);
+  int __attribute__((__unused__)) result = fallocate(_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, off, sz);
   d_assert_msg(result == 0, "result(fd %d): %d errno %d (%s)\n", _fd, result, errno, strerror(errno));
 #else
 #warning macOS version of fallocate goes here
@@ -937,7 +937,9 @@ bool MeshableArena::moveMiniHeapToNewFile(MiniHeap *mh, void *ptr) {
   MiniHeap *leader_mh = mh->meshedLeader();
 
   if (leader_mh != nullptr) {
+#ifndef NDEBUG
     debug("moveMiniHeapToNewFile %d: mh=%p  leader=%p\n", getpid(), mh, leader_mh);
+#endif
   } else {
     leader_mh = mh;
   }
@@ -953,8 +955,10 @@ bool MeshableArena::moveMiniHeapToNewFile(MiniHeap *mh, void *ptr) {
     if (_cowBitmap.isSet(span.offset + i)) {
       hard_assert_msg(i == 0, "moveMiniHeapToNewFile %d: already COW span offset=%u, length=%u", getpid(),
                       span.offset + i, span.length);
+#ifndef NDEBUG
       debug("moveMiniHeapToNewFile %d: trigger doulbe move, just return and try again !!!", getpid(), span.offset + i,
             span.length);
+#endif
       return true;
     }
     d_assert(span.offset == keepOff);

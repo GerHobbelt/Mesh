@@ -170,7 +170,7 @@ public:
   // an attach takes ownership of the reference to mh
   inline void reinit(MiniHeapArray &miniheaps) {
     internal::mwcShuffle(miniheaps.array_begin(), miniheaps.array_end(), _prng);
-    const bool addedCapacity = localRefill(miniheaps);
+    const bool __attribute__((__unused__)) addedCapacity = localRefill(miniheaps);
     d_assert(addedCapacity);
   }
 
