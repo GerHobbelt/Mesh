@@ -62,14 +62,14 @@ private:
 class GlobalHeapStats {
 public:
   atomic_size_t meshCount;
-  size_t mhFreeCount;
-  size_t mhAllocCount;
-  size_t mhHighWaterMark;
+  atomic_size_t mhFreeCount;
+  atomic_size_t mhAllocCount;
+  atomic_size_t mhHighWaterMark;
 };
 
-class GlobalBinCache {
+class CentralCache {
 public:
-  GlobalBinCache() {
+  CentralCache() {
   }
   void init() {
     _readIndex = _writeIndex = 0;
@@ -78,7 +78,7 @@ public:
   size_t totalCache() const {
     size_t sum = 0;
     for (uint32_t i = _readIndex; i < _writeIndex; ++i) {
-      sum += _cache[i % kMaxGlobalVectorCacheLength].size;
+      sum += _cache[i % kMaxCentralCacheLength].size;
     }
     return sum;
   }
@@ -88,34 +88,26 @@ public:
     return _writeIndex - _readIndex;
   }
 
-  inline uint32_t sizeNoLock() const {
-    return _writeIndex - _readIndex;
-  }
-
-  inline bool needFree() const {
-    return size() > kMinGlobalVectorCacheLength;
-  }
-
   inline bool full() const {
-    return size() >= kMaxGlobalVectorCacheLength;
+    return size() >= kMaxCentralCacheLength;
   }
   inline bool empty() const {
     lock_guard<internal::SpinLockType> lock(_lock);
     return _readIndex == _writeIndex;
   }
 
-  bool push(void *head, void *tail, uint32_t size, pid_t current) {
+  bool push(void *head, void *tail, uint32_t size) {
     lock_guard<internal::SpinLockType> lock(_lock);
-    if (sizeNoLock() >= kMaxGlobalVectorCacheLength) {
+    if (_writeIndex - _readIndex >= kMaxCentralCacheLength) {
       return false;
     }
-    const auto writeIndex = _writeIndex % kMaxGlobalVectorCacheLength;
+    const auto writeIndex = _writeIndex % kMaxCentralCacheLength;
     ++_writeIndex;
-    BinCache &cache = _cache[writeIndex];
+    MeshEntry &cache = _cache[writeIndex];
     cache.head = head;
     cache.tail = tail;
+    cache.timestamp = time::now_milliseconds();
     cache.size = size;
-    cache.thread = current;
     return true;
   }
 
@@ -126,27 +118,30 @@ public:
     }
     d_assert(_writeIndex > _readIndex);
     --_writeIndex;
-    const auto popIndex = _writeIndex % kMaxGlobalVectorCacheLength;
-    BinCache &cache = _cache[popIndex];
+    const auto popIndex = _writeIndex % kMaxCentralCacheLength;
+    MeshEntry &cache = _cache[popIndex];
     head = cache.head;
     tail = cache.tail;
     size = cache.size;
     return true;
   }
 
-  bool pop_left(void *&head, void *&tail, uint32_t &size) {
+  bool pop_timeout(void *&head, void *&tail, uint32_t &size, uint64_t deadline) {
     lock_guard<internal::SpinLockType> lock(_lock);
-    if (_readIndex == _writeIndex) {
+    if (_writeIndex - _readIndex < kMinCentralCacheLength) {
       return false;
     }
     d_assert(_writeIndex > _readIndex);
-    const auto popIndex = _readIndex % kMaxGlobalVectorCacheLength;
-    ++_readIndex;
-    if (_readIndex >= kMaxGlobalVectorCacheLength) {
-      _readIndex -= kMaxGlobalVectorCacheLength;
-      _writeIndex -= kMaxGlobalVectorCacheLength;
+    const auto popIndex = _readIndex % kMaxCentralCacheLength;
+    MeshEntry &cache = _cache[popIndex];
+    if (cache.timestamp > deadline) {
+      return false;
     }
-    BinCache &cache = _cache[popIndex];
+    ++_readIndex;
+    if (_readIndex >= kMaxCentralCacheLength) {
+      _readIndex -= kMaxCentralCacheLength;
+      _writeIndex -= kMaxCentralCacheLength;
+    }
     head = cache.head;
     tail = cache.tail;
     size = cache.size;
@@ -154,13 +149,13 @@ public:
   }
 
 private:
-  struct BinCache {
+  struct MeshEntry {
     void *head;
     void *tail;
+    uint64_t timestamp;
     uint32_t size;
-    pid_t thread;
   };
-  BinCache _cache[kMaxGlobalVectorCacheLength];
+  MeshEntry _cache[kMaxCentralCacheLength];
   uint32_t _readIndex{0};
   uint32_t _writeIndex{0};
   mutable internal::SpinLockType _lock{};
@@ -188,8 +183,6 @@ public:
   }
 
   inline void dumpStrings() const {
-    lock_guard<mutex> lock(_miniheapLock);
-
     mesh::debug("TODO: reimplement printOccupancy\n");
     // for (size_t i = 0; i < kNumBins; i++) {
     //   _littleheaps[i].printOccupancy();
@@ -198,13 +191,12 @@ public:
 
   inline void flushAllBins() {
     for (size_t sizeClass = 0; sizeClass < kNumBins; sizeClass++) {
+      lock_guard<mutex> lock(_freelistLock[sizeClass]);
       flushBinLocked(sizeClass);
     }
   }
 
   void scavenge(bool force = false) {
-    lock_guard<mutex> lock(_miniheapLock);
-
     Super::scavenge(force);
   }
 
@@ -232,7 +224,9 @@ public:
 
     _miniheapCount++;
     _stats.mhAllocCount++;
-    _stats.mhHighWaterMark = max(_miniheapCount, _stats.mhHighWaterMark);
+    if (_stats.mhHighWaterMark < _miniheapCount) {
+      _stats.mhHighWaterMark = getAllocatedMiniheapCount();
+    }
 
     return mh;
   }
@@ -244,8 +238,6 @@ public:
     if (unlikely(pageCount == 0)) {
       return nullptr;
     }
-
-    lock_guard<mutex> lock(_miniheapLock);
 
     MiniHeap *mh = allocMiniheapLocked(kClassSizesMax, pageCount, 1, pageCount * kPageSize, pageAlignment);
 
@@ -334,7 +326,7 @@ public:
       return;
     }
 
-    lock_guard<mutex> lock(_miniheapLock);
+    lock_guard<mutex> lock(_freelistLock[sizeClass]);
     for (auto mh : miniheaps) {
       releaseMiniheapLocked(mh, sizeClass);
     }
@@ -393,23 +385,22 @@ public:
   template <uint32_t Size>
   bool allocCache(int sizeClass, void *&head, void *&tail, uint32_t &size, FixedArray<MiniHeap, Size> &miniheaps,
                   pid_t current) {
-    GlobalBinCache &cache = _cache[sizeClass];
+    CentralCache &cache = _cache[sizeClass];
     if (cache.pop(head, tail, size)) {
       return true;
     } else {
-      lock_guard<mutex> lock(_miniheapLock);
       uint32_t objectSize = SizeMap::ByteSizeForClass(sizeClass);
-      allocSmallMiniheapsLocked(sizeClass, objectSize, miniheaps, current);
+      allocSmallMiniheaps(sizeClass, objectSize, miniheaps, current);
       return false;
     }
   }
-  void freeCache(int sizeClass, void *head, void *tail, uint32_t size, pid_t current);
-  void freeSmallCache();
+  void releaseToCentralCache(int sizeClass, void *head, void *tail, uint32_t size, pid_t current);
+  void flushCentralCache(size_t sizeClass);
 
   template <uint32_t Size>
   inline void allocSmallMiniheaps(int sizeClass, uint32_t objectSize, FixedArray<MiniHeap, Size> &miniheaps,
                                   pid_t current) {
-    lock_guard<mutex> lock(_miniheapLock);
+    lock_guard<mutex> lock(_freelistLock[sizeClass]);
     allocSmallMiniheapsLocked(sizeClass, objectSize, miniheaps, current);
   }
 
@@ -500,7 +491,6 @@ public:
   }
 
   void freeMiniheap(MiniHeap *&mh, bool untrack = true) {
-    lock_guard<mutex> lock(_miniheapLock);
     freeMiniheapLocked(mh, untrack);
   }
 
@@ -525,9 +515,9 @@ public:
       }
       const auto type = isMeshed ? internal::PageType::Meshed : internal::PageType::Dirty;
       Super::free(reinterpret_cast<void *>(mh->getSpanStart(arenaBegin())), spanSize, type);
-      ++_stats.mhFreeCount;
       freeMiniheapAfterMeshLocked(mh, untrack);
     }
+    _stats.mhFreeCount += last;
 
     mh = nullptr;
   }
@@ -559,7 +549,6 @@ public:
     if (unlikely(ptr == nullptr))
       return 0;
 
-    lock_guard<mutex> lock(_miniheapLock);
     auto mh = miniheapFor(ptr);
     if (likely(mh)) {
       return mh->objectSize();
@@ -571,7 +560,6 @@ public:
   int mallctl(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
 
   size_t getAllocatedMiniheapCount() const {
-    lock_guard<mutex> lock(_miniheapLock);
     return _miniheapCount;
   }
 
@@ -579,13 +567,19 @@ public:
     _meshPeriodMs = period;
   }
 
+  void setFlushCentralCacheDelay(uint64_t delay) {
+    _flushCentralCacheDelay = delay;
+  }
+
   void lock() {
     _miniheapLock.lock();
+    _spanLock.lock();
     // internal::Heap().lock();
   }
 
   void unlock() {
     // internal::Heap().unlock();
+    _spanLock.unlock();
     _miniheapLock.unlock();
   }
 
@@ -706,9 +700,8 @@ private:
   // we want this on its own cacheline
   EpochLock ATTRIBUTE_ALIGNED(CACHELINE_SIZE) _meshEpoch{};
 
-  // always accessed with the mhRWLock exclusively locked.  cachline
-  // aligned to avoid sharing cacheline with _meshEpoch
-  size_t ATTRIBUTE_ALIGNED(CACHELINE_SIZE) _miniheapCount{0};
+  // cachline aligned to avoid sharing cacheline with _meshEpoch
+  atomic_size_t ATTRIBUTE_ALIGNED(CACHELINE_SIZE) _miniheapCount{0};
 
   // these must only be accessed or modified with the _miniheapLock held
   std::array<std::pair<MiniHeapListEntry, size_t>, kNumBins> _emptyFreelist{
@@ -721,14 +714,18 @@ private:
       Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head,
       Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head};
 
+  mutable mutex ATTRIBUTE_ALIGNED(CACHELINE_SIZE) _freelistLock[kNumBins];
   mutable mutex _miniheapLock{};
+
   GlobalHeapStats _stats{};
 
   // XXX: should be atomic, but has exception spec?
   time::time_point _lastMesh;
   size_t _lastMeshClass{0};
 
-  GlobalBinCache _cache[kNumBins];
+  CentralCache _cache[kNumBins];
+  uint64_t _flushCentralCacheDelay{kFlushCentralCacheDelay};
+
   atomic_size_t _lastFreeClass{0};
 };
 

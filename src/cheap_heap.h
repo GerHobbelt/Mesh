@@ -42,6 +42,7 @@ public:
   }
 
   inline void *alloc() {
+    lock_guard<HL::SpinLockType> lock(_lock);
     if (likely(_freelistOff >= 0)) {
       const auto ptr = _freelist[_freelistOff];
       _freelistOff--;
@@ -72,6 +73,7 @@ public:
   }
 
   inline void free(void *ptr) {
+    lock_guard<HL::SpinLockType> lock(_lock);
     d_assert(ptr >= _arena);
     d_assert(ptr < arenaEnd());
 
@@ -104,6 +106,7 @@ protected:
   void **_freelist{nullptr};
   size_t _arenaOff{1};
   ssize_t _freelistOff{-1};
+  mutable HL::SpinLockType _lock{};
 };
 
 class DynCheapHeap : public OneWayMmapHeap {

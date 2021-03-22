@@ -309,7 +309,7 @@ Span MeshableArena::reservePages(const size_t pageCount, const size_t pageAlignm
   Span result(0, 0);
   auto ok = findPages(pageCount, result, flags);
   if (!ok) {
-    tryAndSendToFree(new internal::FreeCmd(internal::FreeCmd::FLUSH_ALL));
+    tryAndSendToFreeLocked(new internal::FreeCmd(internal::FreeCmd::FLUSH_ALL));
     getSpansFromBg(true);
     ok = findPages(pageCount, result, flags);
     if (!ok) {
@@ -390,6 +390,7 @@ char *MeshableArena::pageAlloc(Span &result, size_t pageCount, size_t pageAlignm
   if (pageCount == 0) {
     return nullptr;
   }
+  lock_guard<mutex> lock(_spanLock);
 
   d_assert(_arenaBegin != nullptr);
 
@@ -425,6 +426,7 @@ void MeshableArena::free(void *ptr, size_t sz, internal::PageType type) {
   d_assert(sz % kPageSize == 0);
 
   const Span span(offsetFor(ptr), sz / kPageSize);
+  lock_guard<mutex> lock(_spanLock);
   freeSpan(span, type);
 }
 
@@ -457,12 +459,6 @@ static size_t flushSpansByOffset(internal::vector<Span> freeSpans[kSpanClassCoun
 
   return freeCount;
 }
-
-struct {
-  bool operator()(const Span &a, const Span &b) const {
-    return a.length > b.length;
-  }
-} customLess;
 
 void MeshableArena::getSpansFromBg(bool wait) {
   bool gotFlushAll = false;
@@ -544,12 +540,25 @@ void MeshableArena::tryAndSendToFree(internal::FreeCmd *fCommand) {
   auto &rt = runtime();
   bool ok = rt.sendFreeCmd(fCommand);
   while (!ok) {
-    getSpansFromBg();
+    {
+      lock_guard<mutex> lock(_spanLock);
+      getSpansFromBg(false);
+    }
+    ok = rt.sendFreeCmd(fCommand);
+  }
+}
+
+void MeshableArena::tryAndSendToFreeLocked(internal::FreeCmd *fCommand) {
+  auto &rt = runtime();
+  bool ok = rt.sendFreeCmd(fCommand);
+  while (!ok) {
+    getSpansFromBg(false);
     ok = rt.sendFreeCmd(fCommand);
   }
 }
 
 void MeshableArena::dumpSpans() {
+  lock_guard<mutex> lock(_spanLock);
   size_t dirty = 0;
   size_t clean = 0;
   for (size_t i = 0; i < kSpanClassCount; ++i) {
@@ -579,10 +588,11 @@ void MeshableArena::partialScavenge() {
     _lastFlushBegin = 0;
   }
 
-  tryAndSendToFree(freeCommand);
+  tryAndSendToFreeLocked(freeCommand);
 }
 
 void MeshableArena::scavenge(bool force) {
+  lock_guard<mutex> lock(_spanLock);
   if (!force && _dirtyPageCount < kMinDirtyPageThreshold) {
     return;
   }
@@ -606,7 +616,7 @@ void MeshableArena::scavenge(bool force) {
   // debug("_toReset size: %d", _toReset.size());
   _toReset.clear();
 
-  tryAndSendToFree(unmapCommand);
+  tryAndSendToFreeLocked(unmapCommand);
 
   internal::FreeCmd *freeCommand = new internal::FreeCmd(internal::FreeCmd::FREE_DIRTY_PAGE);
 
@@ -616,7 +626,7 @@ void MeshableArena::scavenge(bool force) {
 
   _dirtyPageCount -= freeCount;
 
-  tryAndSendToFree(freeCommand);
+  tryAndSendToFreeLocked(freeCommand);
 
   internal::FreeCmd *cleanCommand = new internal::FreeCmd(internal::FreeCmd::CLEAN_PAGE);
   freeCount = flushSpansByOffset(_clean, cleanCommand->spans, _lastFlushBegin, needFreeCount);
@@ -626,10 +636,10 @@ void MeshableArena::scavenge(bool force) {
     _lastFlushBegin = 0;
   }
 
-  tryAndSendToFree(cleanCommand);
+  tryAndSendToFreeLocked(cleanCommand);
   // debug("FreeCmd::CLEAN_PAGE");
 
-  tryAndSendToFree(new internal::FreeCmd(internal::FreeCmd::FLUSH));
+  tryAndSendToFreeLocked(new internal::FreeCmd(internal::FreeCmd::FLUSH));
 
   getSpansFromBg();
 }
@@ -794,7 +804,7 @@ void MeshableArena::prepareForFork() {
     moveRemainPages();
   }
 
-  // tryAndSendToFree(new internal::FreeCmd(internal::FreeCmd::FLUSH_ALL));
+  // tryAndSendToFreeLocked(new internal::FreeCmd(internal::FreeCmd::FLUSH_ALL));
   // getSpansFromBg(true);
 
   internal::Heap().lock();
@@ -836,7 +846,7 @@ void MeshableArena::afterForkParentAndChild() {
     madvise(address, address_size, MADV_DONTDUMP);
   }
 
-  tryAndSendToFree(new internal::FreeCmd(internal::FreeCmd::FLUSH_ALL));
+  tryAndSendToFreeLocked(new internal::FreeCmd(internal::FreeCmd::FLUSH_ALL));
   getSpansFromBg(true);
 
   // remap all the clean spans
@@ -1025,7 +1035,7 @@ void MeshableArena::moveRemainPages() {
     debug("moveRemainPages finished < %u, %u, %u", off, _COWend, _end);
     for (size_t j = 0; j < _COWend; ++j) {
       if (!_cowBitmap.isSet(j)) {
-        tryAndSendToFree(new internal::FreeCmd(internal::FreeCmd::FLUSH_ALL));
+        tryAndSendToFreeLocked(new internal::FreeCmd(internal::FreeCmd::FLUSH_ALL));
         getSpansFromBg(true);
 
         bool found = false;

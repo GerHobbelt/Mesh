@@ -186,6 +186,7 @@ public:
   }
 
   inline void incMeshedSpanCount(size_t pageCount) {
+    lock_guard<mutex> lock(_spanLock);
     ++_meshedSpanCount;
     _meshedPageCount += pageCount;
     if (unlikely(_meshedPageCount > _meshedPageCountHWM)) {
@@ -338,6 +339,7 @@ protected:
   }
   void getSpansFromBg(bool wait = false);
   void tryAndSendToFree(internal::FreeCmd *fCommand);
+  void tryAndSendToFreeLocked(internal::FreeCmd *fCommand);
   bool moveMiniHeapToNewFile(MiniHeap *mh, void *ptr);
   void moveRemainPages();
   void dumpSpans();
@@ -345,6 +347,8 @@ protected:
   MWC _fastPrng;
   bool _isCOWRunning{false};
   bool _needCOWScan{true};
+
+  mutable mutex _spanLock{};
 
 private:
   Offset _end{};  // in pages

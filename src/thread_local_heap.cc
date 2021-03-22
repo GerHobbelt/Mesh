@@ -135,7 +135,7 @@ void ThreadLocalHeap::releaseAll() {
     uint32_t size = shuffleCache.pop_list(shuffleCache.length(), &head, &tail);
     d_assert(shuffleCache.isExhausted());
     d_assert(!shuffleCache.length());
-    _global->freeCache(i, head, tail, size, _current);
+    _global->releaseToCentralCache(i, head, tail, size, _current);
   }
 }
 
@@ -147,13 +147,13 @@ void CACHELINE_ALIGNED_FN ThreadLocalHeap::releaseToCenter(size_t sizeClass) {
   void *head, *tail;
   uint32_t size = shuffleCache.pop_list(shuffleCache.maxCount() / 3, &head, &tail);
   if (size) {
-    _global->freeCache(sizeClass, head, tail, size, _current);
+    _global->releaseToCentralCache(sizeClass, head, tail, size, _current);
     _freeCount = 0;
   }
 }
 
 void CACHELINE_ALIGNED_FN ThreadLocalHeap::releaseToCenter() {
-  _global->freeSmallCache();
+  _global->flushCentralCache(0);
   _freeCount = 0;
 }
 

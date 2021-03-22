@@ -58,6 +58,10 @@ public:
     _heap.setMeshPeriodMs(period);
   }
 
+  void setFlushCentralCacheDelay(uint64_t delay) {
+    _heap.setFlushCentralCacheDelay(delay);
+  }
+
   ssize_t recv(int sockfd, void *buf, size_t len, int flags);
   ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags);
 

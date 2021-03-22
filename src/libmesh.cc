@@ -28,6 +28,14 @@ static void mesh_detect_cpu_features(void) {
 }
 #endif
 
+static long meshGetLongEnv(const char *env, long default_value) {
+  char *envValue = getenv(env);
+  if (envValue) {
+    return strtol(envValue, nullptr, 10);
+  }
+  return default_value;
+}
+
 static __attribute__((constructor)) void libmesh_init() {
   mesh_detect_cpu_features();
   mesh::real::init();
@@ -36,29 +44,25 @@ static __attribute__((constructor)) void libmesh_init() {
   runtime().installSegfaultHandler();
   runtime().initMaxMapCount();
 
-  char *meshPeriodStr = getenv("MESH_PERIOD_MS");
-  if (meshPeriodStr) {
-    long period = strtol(meshPeriodStr, nullptr, 10);
-    if (period < 0) {
-      period = 0;
-    }
-    runtime().setMeshPeriodMs(std::chrono::milliseconds{period});
+  long meshPeriod = meshGetLongEnv("MESH_PERIOD_MS", 0);
+  if (meshPeriod < 0) {
+    meshPeriod = 0;
+  }
+  runtime().setMeshPeriodMs(std::chrono::milliseconds{meshPeriod});
+
+  long flushCentralCacheDelay = meshGetLongEnv("MESH_FLUSH_CENTRAL_CACHE_DELAY", 0);
+  if (flushCentralCacheDelay > 0) {
+    runtime().setFlushCentralCacheDelay(flushCentralCacheDelay);
   }
 
-  char *bgThread = getenv("MESH_BACKGROUND_THREAD");
+  long bgThread = meshGetLongEnv("MESH_BACKGROUND_THREAD", 1);
   if (bgThread) {
-    int shouldThread = atoi(bgThread);
-    if (shouldThread) {
-      runtime().startBgThread();
-    }
+    runtime().startBgThread();
   }
 
-  char *bgFreePhysThread = getenv("MESH_FREEPHYS_THREAD");
+  long bgFreePhysThread = meshGetLongEnv("MESH_FREEPHYS_THREAD", 1);
   if (bgFreePhysThread) {
-    int shouldFreeThread = atoi(bgFreePhysThread);
-    if (shouldFreeThread) {
-      runtime().startFreePhysThread();
-    }
+    runtime().startFreePhysThread();
   }
 }
 

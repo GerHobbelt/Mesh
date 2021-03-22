@@ -63,8 +63,7 @@ void GlobalHeap::freeFor(MiniHeap *mh, void *ptr, size_t startEpoch) {
   // This can also include, for example, single page allocations w/
   // 16KB alignment.
   if (mh->isLargeAlloc()) {
-    lock_guard<mutex> lock(_miniheapLock);
-    freeMiniheapLocked(mh, false);
+    freeMiniheap(mh, false);
     return;
   }
 
@@ -102,7 +101,7 @@ void GlobalHeap::freeFor(MiniHeap *mh, void *ptr, size_t startEpoch) {
   if (startEpoch % 2 == 1 || !_meshEpoch.isSame(startEpoch)) {
     // a mesh was started in between when we looked up our miniheap
     // and now.  synchronize to avoid races
-    lock_guard<mutex> lock(_miniheapLock);
+    lock_guard<mutex> lock(_freelistLock[sizeClass]);
 
     if (mh->createEpoch() != createEpoch) {
       return;
@@ -146,7 +145,7 @@ void GlobalHeap::freeFor(MiniHeap *mh, void *ptr, size_t startEpoch) {
     // the free went through ok; if we _were_ full, or now _are_ empty,
     // make sure to update the littleheaps
     if (!isAttached && (remaining == 0 || freelistId == list::Full)) {
-      lock_guard<mutex> lock(_miniheapLock);
+      lock_guard<mutex> lock(_freelistLock[sizeClass]);
 
       if (mh->createEpoch() != createEpoch) {
         return;
@@ -287,6 +286,7 @@ size_t GlobalHeap::unboundMeshSlowly(MiniHeap *mh) {
     }
   }
   prev->setNextMeshed(nextId);
+
   for (size_t i = 0; i < last; i++) {
     MiniHeap *mh = toFree[i];
     d_assert(mh->isMeshed());
@@ -308,6 +308,10 @@ size_t GlobalHeap::meshSizeClassLocked(size_t sizeClass, MergeSetArray &mergeSet
   // if (_partialFreelist[sizeClass].second < _fullList[sizeClass].second / 15) {
   //   return mergeSetCount;
   // }
+  //
+
+  flushCentralCache(sizeClass);
+  lock_guard<mutex> lock(_freelistLock[sizeClass]);
 
   auto meshFound =
       function<bool(std::pair<MiniHeap *, MiniHeap *> &&)>([&](std::pair<MiniHeap *, MiniHeap *> &&miniheaps) {
@@ -379,7 +383,6 @@ size_t GlobalHeap::meshSizeClassLocked(size_t sizeClass, MergeSetArray &mergeSet
   }
 
   tryAndSendToFree(fCommand);
-
   // flush things once more (since we may have called postFree instead
   // of mesh above)
   flushBinLocked(sizeClass);
@@ -422,7 +425,7 @@ void GlobalHeap::meshAllSizeClassesLocked() {
 
   d_assert(_lastMeshClass < kNumBins);
 
-  flushBinLocked(_lastMeshClass);
+  // flushBin(_lastMeshClass);
   size_t totalMeshCount = 0;
 
   while (SizeMap::ByteSizeForClass(_lastMeshClass) < kPageSize) {
@@ -453,8 +456,6 @@ void GlobalHeap::processCOWPage() {
 void GlobalHeap::dumpStats(int level, bool beDetailed) const {
   if (level < 1)
     return;
-
-  lock_guard<mutex> lock(_miniheapLock);
 
   const auto meshedPageHWM = meshedPageHighWaterMark();
 
@@ -514,7 +515,7 @@ void GlobalHeap::dumpMiniHeaps(size_t sizeClass, const MiniHeapListEntry *minihe
 void GlobalHeap::dumpList(int level) {
   for (size_t sizeClass = 0; sizeClass < kNumBins; ++sizeClass) {
     {
-      lock_guard<mutex> lock(_miniheapLock);
+      lock_guard<mutex> lock(_freelistLock[sizeClass]);
       const auto &freelist = _partialFreelist[sizeClass];
       if (freelist.second) {
         debug("MeshInfo ++++++++++ partial class:%-2zu, length:%-6zu", sizeClass, freelist.second);
@@ -524,7 +525,7 @@ void GlobalHeap::dumpList(int level) {
       }
     }
     {
-      lock_guard<mutex> lock(_miniheapLock);
+      lock_guard<mutex> lock(_freelistLock[sizeClass]);
       const auto &freelist = _fullList[sizeClass];
       if (freelist.second) {
         debug("MeshInfo +++++++++++++ full class:%-2zu, length:%-6zu", sizeClass, freelist.second);
@@ -535,24 +536,22 @@ void GlobalHeap::dumpList(int level) {
     }
   }
   {
-    lock_guard<mutex> lock(_miniheapLock);
     for (size_t i = 0; i < kNumBins; ++i) {
       debug("MeshInfo +++++++++++++ GlobalSmallBinCache class:%-2zu, length:%-3zu(%.2f(MB))", i, _cache[i].size(),
             _cache[i].totalCache() * SizeMap::ByteSizeForClass(i) / 1024.0 / 1024.0);
     }
   }
   if (level > 0) {
-    lock_guard<mutex> lock(_miniheapLock);
     dumpSpans();
   }
 }
 
-void GlobalHeap::freeCache(int sizeClass, void *head, void *tail, uint32_t size, pid_t current) {
+void GlobalHeap::releaseToCentralCache(int sizeClass, void *head, void *tail, uint32_t size, pid_t current) {
   if (!size) {
     return;
   }
-  GlobalBinCache &cache = _cache[sizeClass];
-  if (cache.push(head, tail, size, current)) {
+  CentralCache &cache = _cache[sizeClass];
+  if (cache.push(head, tail, size)) {
     return;
   }
   void *tmp{nullptr};
@@ -564,25 +563,29 @@ void GlobalHeap::freeCache(int sizeClass, void *head, void *tail, uint32_t size,
   maybeMesh();
 }
 
-void GlobalHeap::freeSmallCache() {
-  if (maybeMeshing()) {
-    return;
+void GlobalHeap::flushCentralCache(size_t sizeClass) {
+  bool shouldMesh = false;
+  if (!sizeClass) {
+    const auto old = _lastFreeClass.fetch_add(1, std::memory_order::memory_order_seq_cst);
+    sizeClass = old % kNumBins;
+    shouldMesh = old % 8 == 0;
   }
-  const auto old = _lastFreeClass.fetch_add(1, std::memory_order::memory_order_seq_cst);
-  const auto sizeClass = old % kNumBins;
   void *head = nullptr;
   void *tail = nullptr;
   uint32_t size = 0;
-  GlobalBinCache &cache = _cache[sizeClass];
-  if (cache.needFree()) {
-    cache.pop_left(head, tail, size);
+  size_t totalSize = 0;
+  CentralCache &cache = _cache[sizeClass];
+
+  uint64_t deadline = time::now_milliseconds() - _flushCentralCacheDelay;
+  while (totalSize < 1000 && cache.pop_timeout(head, tail, size, deadline)) {
+    while (head) {
+      void *tmp = *reinterpret_cast<void **>(head);
+      free(head);
+      head = tmp;
+    }
+    totalSize += size;
   }
-  while (head) {
-    void *tmp = *reinterpret_cast<void **>(head);
-    free(head);
-    head = tmp;
-  }
-  if (size || old % 16 == 0) {
+  if (shouldMesh) {
     maybeMesh();
   }
 }

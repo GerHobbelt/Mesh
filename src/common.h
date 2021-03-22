@@ -81,6 +81,7 @@ static constexpr size_t kClassSizesMax = 37;
 static constexpr size_t kAlignment = 8;
 static constexpr int kMinAlign = 16;
 static constexpr uint64_t kPageSize = 4096;
+static constexpr uint64_t kPageMask = kPageSize - 1;
 static constexpr uint64_t kHugePageSize = 4096 * 512;
 static constexpr size_t kMaxFastLargeSize = 256 * 1024;  // 256Kb
 
@@ -123,8 +124,9 @@ static constexpr int16_t kMaxShuffleVectorLength = 256;  // sizeof(uint8_t) << 8
 static constexpr bool kEnableShuffleOnInit = SHUFFLE_ON_INIT == 1;
 static constexpr bool kEnableShuffleOnFree = SHUFFLE_ON_FREE == 1;
 
-static constexpr size_t kMinGlobalVectorCacheLength = 8;
-static constexpr size_t kMaxGlobalVectorCacheLength = 32;
+static constexpr uint64_t kFlushCentralCacheDelay = 10 * 1000;
+static constexpr size_t kMinCentralCacheLength = 8;
+static constexpr size_t kMaxCentralCacheLength = 512;
 
 // madvise(DONTDUMP) the heap to make reasonable coredumps
 static constexpr bool kAdviseDump = true;
@@ -327,11 +329,21 @@ inline time_point ATTRIBUTE_ALWAYS_INLINE now() {
 #ifdef __linux__
   using namespace std::chrono;
   struct timespec tp;
-  auto err = clock_gettime(CLOCK_MONOTONIC_COARSE, &tp);
-  hard_assert(err == 0);
+  clock_gettime(CLOCK_MONOTONIC_COARSE, &tp);
   return time_point(seconds(tp.tv_sec) + nanoseconds(tp.tv_nsec));
 #else
   return std::chrono::high_resolution_clock::now();
+#endif
+}
+
+inline uint64_t ATTRIBUTE_ALWAYS_INLINE now_milliseconds() {
+#ifdef __linux__
+  struct timespec tp;
+  clock_gettime(CLOCK_MONOTONIC_COARSE, &tp);
+  return tp.tv_sec * 1000ul + tp.tv_nsec / 1000.0;
+#else
+  hard_assert(false);
+  return 0;
 #endif
 }
 }  // namespace time
