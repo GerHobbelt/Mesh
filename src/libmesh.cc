@@ -44,7 +44,7 @@ static __attribute__((constructor)) void libmesh_init() {
   runtime().installSegfaultHandler();
   runtime().initMaxMapCount();
 
-  long meshPeriod = meshGetLongEnv("MESH_PERIOD_MS", 0);
+  long meshPeriod = meshGetLongEnv("MESH_PERIOD_MS", kMeshPeriodMs.count());
   if (meshPeriod < 0) {
     meshPeriod = 0;
   }

@@ -69,8 +69,8 @@ public:
 
   void releaseAll();
 
-  void ATTRIBUTE_NEVER_INLINE CACHELINE_ALIGNED_FN releaseToCenter(size_t sizeClass);
-  void ATTRIBUTE_NEVER_INLINE CACHELINE_ALIGNED_FN releaseToCenter();
+  void ATTRIBUTE_NEVER_INLINE CACHELINE_ALIGNED_FN releaseToCentralCache(size_t sizeClass);
+  void ATTRIBUTE_NEVER_INLINE CACHELINE_ALIGNED_FN flushCentralCache();
   void *ATTRIBUTE_NEVER_INLINE CACHELINE_ALIGNED_FN smallAllocSlowpath(size_t sizeClass);
 
   inline void *memalign(size_t alignment, size_t size) {
@@ -197,13 +197,13 @@ public:
     if (likely(sizeClass && sizeClass < kNumBins)) {
       ShuffleCache &shuffleCache = _shuffleCache[sizeClass];
       if (unlikely(shuffleCache.isFull())) {
-        releaseToCenter(sizeClass);
+        releaseToCentralCache(sizeClass);
       }
       shuffleCache.free(ptr);
       return;
     }
     if (unlikely(_freeCount > 256)) {
-      releaseToCenter();
+      flushCentralCache();
     }
     _global->free(ptr);
   }

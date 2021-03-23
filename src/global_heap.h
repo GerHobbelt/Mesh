@@ -679,7 +679,7 @@ public:
     return bucket;
   }
 
-  void dumpMiniHeaps(size_t sizeClass, const MiniHeapListEntry *miniheaps, int level);
+  void dumpMiniHeaps(const char *prefix, size_t sizeClass, const MiniHeapListEntry *miniheaps, int level);
   void dumpList(int level);
 
 private:

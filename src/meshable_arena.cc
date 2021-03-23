@@ -563,20 +563,29 @@ void MeshableArena::dumpSpans() {
   size_t clean = 0;
   for (size_t i = 0; i < kSpanClassCount; ++i) {
     if (_dirty[i].size() || _clean[i].size()) {
-      debug("MeshInfo spanClass:%-3lu  dirty:%6zu, clean:%6zu", i, _dirty[i].size(), _clean[i].size());
-      dirty += _dirty[i].size();
-      clean += _clean[i].size();
+      debug("MeshSpan --++++ spanClass:%-3lu  dirty:%6zu, clean:%6zu", i, _dirty[i].size(), _clean[i].size());
+      if (i != kSpanClassCount - 1) {
+        dirty += _dirty[i].size() * (i + 1);
+        clean += _clean[i].size() * (i + 1);
+      } else {
+        for (auto &s : _dirty[i]) {
+          dirty += s.length;
+        }
+        for (auto &s : _clean[i]) {
+          clean += s.length;
+        }
+      }
     }
   }
-  debug("MeshInfo span summary reset: %zu, dirty: %zu, clean: %zu", _toReset.size(), dirty, clean);
+  debug("MeshSpan --++++ spanClass:SUM reset:%zu, dirty:%zu(%.2f(MB)), clean:%zu(%.2f(MB))", _toReset.size(), dirty,
+        dirty * 4.0 / 1024, clean, clean * 4.0 / 1024);
 }
 
 void MeshableArena::partialScavenge() {
-  size_t needFreeCount = 0;
-
-  if (_dirtyPageCount > kMaxDirtyPageThreshold) {
-    needFreeCount = _end / 5;
+  if (_dirtyPageCount < kMaxDirtyPageThreshold) {
+    return;
   }
+  size_t needFreeCount = _end / 5;
 
   internal::FreeCmd *freeCommand = new internal::FreeCmd(internal::FreeCmd::FREE_DIRTY_PAGE);
   size_t freeCount = flushSpansByOffset(_dirty, freeCommand->spans, _lastFlushBegin, needFreeCount);

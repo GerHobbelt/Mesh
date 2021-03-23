@@ -139,7 +139,7 @@ void ThreadLocalHeap::releaseAll() {
   }
 }
 
-void CACHELINE_ALIGNED_FN ThreadLocalHeap::releaseToCenter(size_t sizeClass) {
+void CACHELINE_ALIGNED_FN ThreadLocalHeap::releaseToCentralCache(size_t sizeClass) {
   if (unlikely(_global->maybeMeshing())) {
     return;
   }
@@ -152,7 +152,7 @@ void CACHELINE_ALIGNED_FN ThreadLocalHeap::releaseToCenter(size_t sizeClass) {
   }
 }
 
-void CACHELINE_ALIGNED_FN ThreadLocalHeap::releaseToCenter() {
+void CACHELINE_ALIGNED_FN ThreadLocalHeap::flushCentralCache() {
   _global->flushCentralCache(0);
   _freeCount = 0;
 }
