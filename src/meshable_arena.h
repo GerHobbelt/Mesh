@@ -245,7 +245,7 @@ private:
     // this happens when we are trying to get an aligned allocation
     // and returning excess back to the arena
     if (flags == internal::PageType::Clean) {
-      _clean[span.spanClass()].push_back(span);
+      _clean[span.spanClass()].emplace_back(span);
       // moveBiggerTofirst(_clean[span.spanClass()]);
       d_assert(_cowBitmap.isSet(span.offset));
       return;
@@ -261,7 +261,7 @@ private:
         resetSpanMapping(span);
       }
 
-      _dirty[span.spanClass()].push_back(span);
+      _dirty[span.spanClass()].emplace_back(span);
       // moveBiggerTofirst(_dirty[span.spanClass()]);
       _dirtyPageCount += span.length;
 
@@ -276,7 +276,7 @@ private:
         trackCOWed(span);
       }
 
-      _toReset.push_back(span);
+      _toReset.emplace_back(span);
     }
   }
 

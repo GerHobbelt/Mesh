@@ -132,20 +132,23 @@ void ThreadLocalHeap::releaseAll() {
   for (size_t i = 1; i < kNumBins; i++) {
     ShuffleCache &shuffleCache = _shuffleCache[i];
     void *head, *tail;
-    uint32_t size = shuffleCache.pop_list(shuffleCache.length(), &head, &tail);
-    d_assert(shuffleCache.isExhausted());
-    d_assert(!shuffleCache.length());
-    _global->releaseToCentralCache(i, head, tail, size, _current);
+    if (!shuffleCache.isExhausted()) {
+      if (shuffleCache.length() > SizeMap::NumToMoveForClass(i)) {
+        uint32_t size = shuffleCache.pop_list(SizeMap::NumToMoveForClass(i), head, tail);
+        _global->releaseToCentralCache(i, head, tail, size, _current);
+      }
+      uint32_t size = shuffleCache.pop_list(shuffleCache.length(), head, tail);
+      _global->releaseToCentralCache(i, head, tail, size, _current);
+      d_assert(shuffleCache.isExhausted());
+      d_assert(!shuffleCache.length());
+    }
   }
 }
 
 void CACHELINE_ALIGNED_FN ThreadLocalHeap::releaseToCentralCache(size_t sizeClass) {
-  if (unlikely(_global->maybeMeshing())) {
-    return;
-  }
   ShuffleCache &shuffleCache = _shuffleCache[sizeClass];
   void *head, *tail;
-  uint32_t size = shuffleCache.pop_list(shuffleCache.maxCount() / 3, &head, &tail);
+  uint32_t size = shuffleCache.pop_list(SizeMap::NumToMoveForClass(sizeClass), head, tail);
   if (size) {
     _global->releaseToCentralCache(sizeClass, head, tail, size, _current);
     _freeCount = 0;
@@ -168,7 +171,6 @@ void *CACHELINE_ALIGNED_FN ThreadLocalHeap::smallAllocSlowpath(size_t sizeClass)
     return shuffleCache.malloc();
   } else {
     ShuffleVector &shuffleVector = _shuffleVector[sizeClass];
-    shuffleCache.setMaxCount(shuffleVector.maxCount());
     shuffleVector.reinit(miniheaps);
     _global->releaseMiniheaps(sizeClass, miniheaps);
     return shuffleCache.malloc();

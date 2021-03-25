@@ -37,9 +37,9 @@ static long meshGetLongEnv(const char *env, long default_value) {
 }
 
 static __attribute__((constructor)) void libmesh_init() {
+  SizeMap::Init();
   mesh_detect_cpu_features();
   mesh::real::init();
-
   runtime().createSignalFd();
   runtime().installSegfaultHandler();
   runtime().initMaxMapCount();

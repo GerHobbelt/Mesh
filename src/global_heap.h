@@ -671,7 +671,7 @@ public:
     while (nextId != list::Head) {
       auto mh = GetMiniHeap(nextId);
       if (mh->isMeshingCandidate() && (mh->fullness() < kOccupancyCutoff)) {
-        bucket.push_back(mh);
+        bucket.emplace_back(mh);
       }
       nextId = mh->getFreelist()->next();
     }

@@ -126,7 +126,7 @@ static constexpr bool kEnableShuffleOnFree = SHUFFLE_ON_FREE == 1;
 
 static constexpr uint64_t kFlushCentralCacheDelay = 10 * 1000;
 static constexpr size_t kMinCentralCacheLength = 8;
-static constexpr size_t kMaxCentralCacheLength = 512;
+static constexpr size_t kMaxCentralCacheLength = 1024;
 
 // madvise(DONTDUMP) the heap to make reasonable coredumps
 static constexpr bool kAdviseDump = true;
@@ -413,8 +413,11 @@ private:
   }
 
   // Mapping from size class to max size storable in that class
-  static const int32_t class_to_size_[kClassSizesMax];
-  static const int32_t class_to_page_[kClassSizesMax];
+  static const uint32_t class_to_size_[kClassSizesMax];
+  static const uint32_t class_to_page_[kClassSizesMax];
+
+  static uint32_t class_max_cache_[kClassSizesMax];
+  static uint32_t class_num_to_move_[kClassSizesMax];
 
 public:
   static constexpr size_t num_size_classes = 25;
@@ -428,7 +431,7 @@ public:
     return class_array_[ClassIndex(size)];
   }
 
-  static inline int SizeClassToPageCount(size_t sizeClass) {
+  static inline uint32_t SizeClassToPageCount(size_t sizeClass) {
     return class_to_page_[sizeClass];
   }
 
@@ -446,18 +449,28 @@ public:
 
   // Get the byte-size for a specified class
   // static inline int32_t ATTRIBUTE_ALWAYS_INLINE ByteSizeForClass(uint32_t cl) {
-  static inline size_t ATTRIBUTE_ALWAYS_INLINE ByteSizeForClass(int32_t cl) {
+  static inline uint32_t ATTRIBUTE_ALWAYS_INLINE ByteSizeForClass(uint32_t cl) {
     return class_to_size_[static_cast<uint32_t>(cl)];
   }
 
-  static inline size_t ObjectCountForClass(int32_t cl) {
+  static inline uint32_t ObjectCountForClass(uint32_t cl) {
     return SizeClassToPageCount(cl) * kPageSize / ByteSizeForClass(cl);
   }
 
+  static inline uint32_t NumToMoveForClass(uint32_t cl) {
+    return class_num_to_move_[cl];
+  }
+
+  static inline uint32_t MaxCacheForClass(uint32_t cl) {
+    return class_max_cache_[cl];
+  }
+
   // Mapping from size class to max size storable in that class
-  static inline int32_t class_to_size(uint32_t cl) {
+  static inline uint32_t class_to_size(uint32_t cl) {
     return class_to_size_[cl];
   }
+
+  static void Init();
 };
 }  // namespace mesh
 

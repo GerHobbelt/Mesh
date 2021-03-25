@@ -561,9 +561,11 @@ void GlobalHeap::releaseToCentralCache(int sizeClass, void *head, void *tail, ui
   if (!size) {
     return;
   }
-  CentralCache &cache = _cache[sizeClass];
-  if (cache.push(head, tail, size)) {
-    return;
+  if (size <= SizeMap::NumToMoveForClass(sizeClass)) {
+    CentralCache &cache = _cache[sizeClass];
+    if (cache.push(head, tail, size)) {
+      return;
+    }
   }
   void *tmp{nullptr};
   while (head) {
@@ -609,7 +611,7 @@ void ATTRIBUTE_NEVER_INLINE halfSplit(MWC &prng, size_t sizeClass, MiniHeapListE
   d_assert(rightSize == 0);
 
   size_t allSize = 0;
-  size_t fullness = std::min(SizeMap::ObjectCountForClass(sizeClass), 64ul);
+  size_t fullness = std::min(SizeMap::ObjectCountForClass(sizeClass), 64u);
   fullness = fullness * kOccupancyCutoff;
 
   MiniHeapID mhId = miniheaps->next();

@@ -183,7 +183,7 @@ void MeshableArena::expandArena(size_t minPagesAdded) {
     trackCOWed(expansion);
     resetSpanMapping(expansion);
   }
-  _clean[expansion.spanClass()].push_back(expansion);
+  _clean[expansion.spanClass()].emplace_back(expansion);
   // debug("expandArena : %d, end=%d\n", minPagesAdded, _end);
 }
 
@@ -232,7 +232,7 @@ bool MeshableArena::findPagesInner(internal::vector<Span> freeSpans[kSpanClassCo
 
   auto ci = rest.spanClass();
   if (!rest.empty()) {
-    freeSpans[ci].push_back(rest);
+    freeSpans[ci].emplace_back(rest);
     moveBiggerTofirst(freeSpans[ci]);
   }
   d_assert(span.length == pageCount);
@@ -257,7 +257,7 @@ bool MeshableArena::findPagesInnerFast(internal::vector<Span> freeSpans[kSpanCla
   // put the part we don't need back in the reuse pile
   Span rest = span.splitAfter(pageCount);
   if (!rest.empty()) {
-    freeSpans[rest.spanClass()].push_back(rest);
+    freeSpans[rest.spanClass()].emplace_back(rest);
     moveBiggerTofirst(freeSpans[rest.spanClass()]);
   }
   d_assert(span.length == pageCount);

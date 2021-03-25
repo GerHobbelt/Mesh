@@ -27,13 +27,28 @@ const unsigned char SizeMap::class_array_[kClassArraySize] = {
 };
 
 ATTRIBUTE_ALIGNED(CACHELINE_SIZE)
-const int32_t SizeMap::class_to_size_[kClassSizesMax] = {
+const uint32_t SizeMap::class_to_size_[kClassSizesMax] = {
     16,  16,   32,   48,   64,   80,   96,   112,  128,  160,  192,  224,  256,  320,  384,   448,   512,   640,   768,
     896, 1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192, 10240, 12288, 14336, 16384,
 };
 
-const int32_t SizeMap::class_to_page_[kClassSizesMax] = {1, 1, 1, 1, 1, 1, 3, 2, 1, 2, 1, 1, 1, 5, 3, 1, 1, 3, 3,
-                                                         2, 1, 5, 3, 4, 2, 5, 3, 7, 2, 5, 3, 7, 4, 5, 6, 7, 8};
+const uint32_t SizeMap::class_to_page_[kClassSizesMax] = {1, 1, 1, 1, 1, 1, 3, 2, 1, 2, 1, 1, 1, 5, 3, 1, 1, 3, 3,
+                                                          2, 1, 5, 3, 4, 2, 5, 3, 7, 2, 5, 3, 7, 4, 5, 6, 7, 8};
+
+uint32_t SizeMap::class_max_cache_[kClassSizesMax] = {};
+uint32_t SizeMap::class_num_to_move_[kClassSizesMax] = {};
+
+void SizeMap::Init() {
+  for (size_t sizeClass = 0; sizeClass < kClassSizesMax; ++sizeClass) {
+    uint32_t _objectCount = ObjectCountForClass(sizeClass);
+    uint32_t _maxCount = _objectCount * 6;
+    d_assert(_maxCount > 0);
+    class_max_cache_[sizeClass] = _maxCount;
+
+    // make sure > 1/2
+    class_num_to_move_[sizeClass] = _maxCount / 2 + 1;
+  }
+}
 
 // const internal::BinToken::Size internal::BinToken::Max = numeric_limits<uint32_t>::max();
 // const internal::BinToken::Size internal::BinToken::MinFlags = numeric_limits<uint32_t>::max() - 4;

@@ -31,40 +31,66 @@ public:
   }
 
   inline void ATTRIBUTE_ALWAYS_INLINE push(void *ptr) {
-    *reinterpret_cast<void **>(ptr) = _ptr;
-    _ptr = ptr;
+    *reinterpret_cast<void **>(ptr) = _head;
+    _head = ptr;
+    if (_tail == nullptr) {
+      _tail = ptr;
+    }
+    if (unlikely(_length == SizeMap::NumToMoveForClass(_sizeClass))) {
+      _anchor = _head;
+    }
     ++_length;
   }
 
   inline void ATTRIBUTE_ALWAYS_INLINE push_list(void *head, void *tail, uint32_t length) {
-    *reinterpret_cast<void **>(tail) = _ptr;
-    _ptr = head;
+    *reinterpret_cast<void **>(tail) = _head;
+    _head = head;
     _length += length;
+    if (!_tail) {
+      _tail = tail;
+    }
+    _anchor = nullptr;
   }
 
   inline void *ATTRIBUTE_ALWAYS_INLINE pop() {
-    void *val = _ptr;
-    _ptr = *reinterpret_cast<void **>(_ptr);
+    void *val = _head;
+    _head = *reinterpret_cast<void **>(_head);
     --_length;
+    if (unlikely(val == _anchor)) {
+      _anchor = nullptr;
+      d_assert(_length == SizeMap::NumToMoveForClass(_sizeClass));
+    }
+    if (_head == nullptr) {
+      _tail = nullptr;
+    }
     return val;
   }
 
-  inline uint32_t pop_list(uint32_t size, void **head, void **tail) {
-    *head = _ptr;
-    void *tmp = nullptr;
-    uint32_t i = 0;
-    while (_ptr && i < size) {
-      d_assert(_length > 0);
-      ++i;
-      --_length;
-      tmp = _ptr;
-      _ptr = *reinterpret_cast<void **>(_ptr);
+  uint32_t pop_list(uint32_t size, void *&head, void *&tail) {
+    if (_length > size) {
+      d_assert(size == SizeMap::NumToMoveForClass(_sizeClass));
+      d_assert(_anchor != nullptr);
+      d_assert(_length >= size);
+
+      head = *reinterpret_cast<void **>(_anchor);
+      *reinterpret_cast<void **>(_anchor) = nullptr;
+      tail = _tail;
+      _tail = _anchor;
+      _anchor = nullptr;
+      _length -= size;
+
+      d_assert(_length == lengthSlowly(_head));
+      d_assert(size == lengthSlowly(head));
+      return size;
+    } else {
+      d_assert(_length <= size);
+      head = _head;
+      tail = _tail;
+      size = _length;
+      _head = _tail = _anchor = nullptr;
+      _length = 0;
+      return size;
     }
-    if (tmp) {
-      *reinterpret_cast<void **>(tmp) = nullptr;
-    }
-    *tail = tmp;
-    return i;
   }
 
   inline void ATTRIBUTE_ALWAYS_INLINE free(void *ptr) {
@@ -72,29 +98,40 @@ public:
   }
 
   inline bool isFull() const {
-    return _length >= _maxCount;
+    return _length >= maxCount();
   }
 
   inline bool isExhausted() const {
-    return _ptr == nullptr;
+    return _head == nullptr;
   }
 
   inline uint32_t length() const {
     return _length;
   }
 
-  inline uint32_t maxCount() const {
-    return _maxCount;
+  uint32_t lengthSlowly(void *p) const {
+    uint32_t length = 0;
+    while (p) {
+      ++length;
+      p = *reinterpret_cast<void **>(p);
+    }
+    return length;
   }
 
-  inline void setMaxCount(uint32_t maxCount) {
-    _maxCount = maxCount;
+  inline uint32_t maxCount() const {
+    return SizeMap::MaxCacheForClass(_sizeClass);
+  }
+
+  void setSizeClass(uint32_t sizeClass) {
+    _sizeClass = sizeClass;
   }
 
 private:
-  void *_ptr{nullptr};
+  void *_head{nullptr};
+  void *_tail{nullptr};
+  void *_anchor{nullptr};
   uint32_t _length{0};
-  uint32_t _maxCount{0};
+  uint32_t _sizeClass{0};
 };
 
 class ShuffleVector {
@@ -139,10 +176,6 @@ public:
     return allocCount;
   }
 
-  inline uint32_t maxCount() const {
-    return _maxCount;
-  }
-
   inline uint32_t objectCount() const {
     return _objectCount;
   }
@@ -183,18 +216,15 @@ public:
     uint32_t sz = SizeMap::ByteSizeForClass(sizeClass);
     _arenaBegin = arenaBegin;
     _objectSize = sz;
-    _objectCount = SizeMap::SizeClassToPageCount(sizeClass) * kPageSize / sz;
-    _maxCount = _objectCount * 6;
+    _objectCount = SizeMap::ObjectCountForClass(sizeClass);
     _cache = cache;
-    _cache->setMaxCount(_maxCount);
-    hard_assert(_maxCount > 0);
+    _cache->setSizeClass(sizeClass);
   }
 
 private:
   MWC _prng;
   ShuffleCache *_cache{nullptr};
   const char *_arenaBegin;
-  uint32_t _maxCount{0};
   uint32_t _objectCount{0};
   uint32_t _objectSize{0};
 } CACHELINE_ALIGNED;
