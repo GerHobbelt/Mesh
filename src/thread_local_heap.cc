@@ -79,6 +79,7 @@ ThreadLocalHeap *ThreadLocalHeap::CreateHeapIfNecessary() {
     const pthread_t current = pthread_self();
 
     if (maybeReentrant) {
+      SizeMap::Init();
       for (ThreadLocalHeap *h = _threadLocalHeaps; h != nullptr; h = h->_next) {
         if (h->_pthreadCurrent == current) {
           heap = h;
@@ -156,7 +157,7 @@ void CACHELINE_ALIGNED_FN ThreadLocalHeap::releaseToCentralCache(size_t sizeClas
 }
 
 void CACHELINE_ALIGNED_FN ThreadLocalHeap::flushCentralCache() {
-  _global->flushCentralCache(0);
+  _global->flushCentralCache();
   _freeCount = 0;
 }
 
@@ -165,12 +166,16 @@ void *CACHELINE_ALIGNED_FN ThreadLocalHeap::smallAllocSlowpath(size_t sizeClass)
   ShuffleCache &shuffleCache = _shuffleCache[sizeClass];
   void *head, *tail;
   uint32_t size;
-  mesh::MiniHeapArray miniheaps{};
-  if (_global->allocCache(sizeClass, head, tail, size, miniheaps, _current)) {
+  if (_global->allocFromCentralCache(sizeClass, head, tail, size)) {
     shuffleCache.push_list(head, tail, size);
     return shuffleCache.malloc();
   } else {
     ShuffleVector &shuffleVector = _shuffleVector[sizeClass];
+
+    mesh::MiniHeapArray miniheaps{};
+    const auto objectSize = SizeMap::ByteSizeForClass(sizeClass);
+
+    _global->allocSmallMiniheaps(sizeClass, objectSize, miniheaps, _current);
     shuffleVector.reinit(miniheaps);
     _global->releaseMiniheaps(sizeClass, miniheaps);
     return shuffleCache.malloc();

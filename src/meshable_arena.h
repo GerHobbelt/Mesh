@@ -151,6 +151,7 @@ public:
     return _maxMeshCount;
   }
 
+  void releaseToReset();
   // protected:
   // public for testing
   void scavenge(bool force);
@@ -277,6 +278,9 @@ private:
       }
 
       _toReset.emplace_back(span);
+      if (unlikely(_toReset.size() > 1000u)) {
+        releaseToReset();
+      }
     }
   }
 

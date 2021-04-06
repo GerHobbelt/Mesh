@@ -49,10 +49,9 @@ inline bool bitmapsMeshable(const Bitmap::word_t *__restrict__ bitmap1, const Bi
 namespace method {
 
 // split miniheaps into two lists in a random order
-void halfSplit(MWC &prng, MiniHeapListEntry *miniheaps, size_t sizeClass, SplitArray &all, size_t &leftSize,
-               size_t &rightSize) noexcept;
+void halfSplit(MWC &prng, MiniHeapListEntry *miniheaps, SplitArray &all, size_t &leftSize, size_t &rightSize) noexcept;
 
-void shiftedSplitting(MWC &prng, size_t sizeClass, MiniHeapListEntry *miniheaps, SplitArray &all,
+void shiftedSplitting(MWC &prng, MiniHeapListEntry *miniheaps, SplitArray &all,
                       const function<bool(std::pair<MiniHeap *, MiniHeap *> &&)> &meshFound) noexcept;
 }  // namespace method
 }  // namespace mesh

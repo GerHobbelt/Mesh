@@ -37,17 +37,37 @@ const uint32_t SizeMap::class_to_page_[kClassSizesMax] = {1, 1, 1, 1, 1, 1, 3, 2
 
 uint32_t SizeMap::class_max_cache_[kClassSizesMax] = {};
 uint32_t SizeMap::class_num_to_move_[kClassSizesMax] = {};
+uint32_t SizeMap::class_occupancy_cutoff_[kClassSizesMax] = {};
+
+uint64_t SizeMap::progress_start_time = 0;
 
 void SizeMap::Init() {
   for (size_t sizeClass = 0; sizeClass < kClassSizesMax; ++sizeClass) {
-    uint32_t _objectCount = ObjectCountForClass(sizeClass);
-    uint32_t _maxCount = _objectCount * 6;
-    d_assert(_maxCount > 0);
-    class_max_cache_[sizeClass] = _maxCount;
+    uint32_t objectCount = ObjectCountForClass(sizeClass);
+    uint32_t maxCount = objectCount * 6;
+    d_assert(maxCount > 0);
+    class_max_cache_[sizeClass] = maxCount;
 
     // make sure > 1/2
-    class_num_to_move_[sizeClass] = _maxCount / 2 + 1;
+    class_num_to_move_[sizeClass] = maxCount / 2 + 1;
+
+    if (ByteSizeForClass(sizeClass) < kPageSize) {
+      class_occupancy_cutoff_[sizeClass] = static_cast<uint32_t>(objectCount * kOccupancyCutoff);
+    } else {
+      class_occupancy_cutoff_[sizeClass] = static_cast<uint32_t>(objectCount + 1);
+    }
   }
+  progress_start_time = time::now_milliseconds();
+}
+
+void SizeMap::SetOccupancyCutoff(uint32_t cl, size_t partialSize) {
+  partialSize /= 1024;
+  float cutoff = 0.8 - 0.03 * partialSize;
+  if (cutoff < 0.3) {
+    cutoff = 0.3;
+  }
+  uint32_t objectCount = ObjectCountForClass(cl);
+  class_occupancy_cutoff_[cl] = objectCount * cutoff;
 }
 
 // const internal::BinToken::Size internal::BinToken::Max = numeric_limits<uint32_t>::max();
@@ -336,9 +356,7 @@ size_t mergeSpans(internal::vector<Span> &spans) {
     // sort and merge spans
     // std::sort(spans.begin(), spans.end());
 
-    internal::vector<Span> tmpSpans;
-    tmpSpans.reserve(spans.size());
-
+    auto slotIt = spans.begin();
     auto leftIt = spans.begin();
     auto rightIt = spans.begin() + 1;
 
@@ -351,15 +369,17 @@ size_t mergeSpans(internal::vector<Span> &spans) {
         ++rightIt;
         continue;
       } else {
-        tmpSpans.emplace_back(leftIt->offset, leftIt->length);
+        slotIt->offset = leftIt->offset;
+        slotIt->length = leftIt->length;
         leftIt = rightIt;
         ++rightIt;
+        ++slotIt;
       }
     }
-    tmpSpans.emplace_back(leftIt->offset, leftIt->length);
-    spans.swap(tmpSpans);
+    slotIt->offset = leftIt->offset;
+    slotIt->length = leftIt->length;
+    spans.resize(slotIt + 1 - spans.begin());
   }
-
   return mergeCount;
 }
 

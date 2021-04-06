@@ -90,7 +90,7 @@ static constexpr size_t kMaxMergeSets = 4096;
 
 static constexpr size_t kMaxCOWPage = 1000;
 // cutoff to be considered for meshing
-static constexpr double kOccupancyCutoff = .8;
+static constexpr double kOccupancyCutoff = .75;
 
 // if we have, e.g. a kernel-imposed max_map_count of 2^16 (65k) we
 // can only safely have about 30k meshes before we are at risk of
@@ -123,8 +123,9 @@ static constexpr size_t kMaxMiniheapsPerShuffleVector = 24;
 static constexpr int16_t kMaxShuffleVectorLength = 256;  // sizeof(uint8_t) << 8
 static constexpr bool kEnableShuffleOnInit = SHUFFLE_ON_INIT == 1;
 static constexpr bool kEnableShuffleOnFree = SHUFFLE_ON_FREE == 1;
+static constexpr bool kEnableRecordMiniheapAlive = false;
 
-static constexpr uint64_t kFlushCentralCacheDelay = 10 * 1000;
+static constexpr uint64_t kFlushCentralCacheDelay = 60 * 1000;
 static constexpr size_t kMinCentralCacheLength = 8;
 static constexpr size_t kMaxCentralCacheLength = 1024;
 
@@ -152,7 +153,7 @@ static constexpr size_t kForkCopyFileSize = 32 * 1024 * 1024ul;
 
 // BinnedTracker
 static constexpr size_t kBinnedTrackerBinCount = 1;
-static constexpr size_t kBinnedTrackerMaxEmpty = 128;
+static constexpr size_t kBinnedTrackerMaxEmpty = 64;
 
 static inline constexpr size_t PageCount(size_t sz) {
   return (sz + (kPageSize - 1)) / kPageSize;
@@ -321,33 +322,6 @@ inline uint64_t seed() {
 }
 }  // namespace internal
 
-namespace time {
-using clock = std::chrono::high_resolution_clock;
-using time_point = std::chrono::time_point<clock>;
-
-inline time_point ATTRIBUTE_ALWAYS_INLINE now() {
-#ifdef __linux__
-  using namespace std::chrono;
-  struct timespec tp;
-  clock_gettime(CLOCK_MONOTONIC_COARSE, &tp);
-  return time_point(seconds(tp.tv_sec) + nanoseconds(tp.tv_nsec));
-#else
-  return std::chrono::high_resolution_clock::now();
-#endif
-}
-
-inline uint64_t ATTRIBUTE_ALWAYS_INLINE now_milliseconds() {
-#ifdef __linux__
-  struct timespec tp;
-  clock_gettime(CLOCK_MONOTONIC_COARSE, &tp);
-  return tp.tv_sec * 1000ul + tp.tv_nsec / 1000.0;
-#else
-  hard_assert(false);
-  return 0;
-#endif
-}
-}  // namespace time
-
 #define PREDICT_TRUE likely
 
 // from tcmalloc/gperftools
@@ -418,9 +392,11 @@ private:
 
   static uint32_t class_max_cache_[kClassSizesMax];
   static uint32_t class_num_to_move_[kClassSizesMax];
+  static uint32_t class_occupancy_cutoff_[kClassSizesMax];  // objectCount * kOccupancyCutoff
 
 public:
   static constexpr size_t num_size_classes = 25;
+  static uint64_t progress_start_time;
 
   // Constructor should do nothing since we rely on explicit Init()
   // call, which may or may not be called before the constructor runs.
@@ -457,6 +433,12 @@ public:
     return SizeClassToPageCount(cl) * kPageSize / ByteSizeForClass(cl);
   }
 
+  static inline uint32_t OccupancyCutoffForClass(uint32_t cl) {
+    return class_occupancy_cutoff_[cl];
+  }
+
+  static void SetOccupancyCutoff(uint32_t cl, size_t partialSize);
+
   static inline uint32_t NumToMoveForClass(uint32_t cl) {
     return class_num_to_move_[cl];
   }
@@ -472,6 +454,39 @@ public:
 
   static void Init();
 };
+
+namespace time {
+using clock = std::chrono::high_resolution_clock;
+using time_point = std::chrono::time_point<clock>;
+
+inline time_point ATTRIBUTE_ALWAYS_INLINE now() {
+#ifdef __linux__
+  using namespace std::chrono;
+  struct timespec tp;
+  clock_gettime(CLOCK_MONOTONIC_COARSE, &tp);
+  return time_point(seconds(tp.tv_sec) + nanoseconds(tp.tv_nsec));
+#else
+  return std::chrono::high_resolution_clock::now();
+#endif
+}
+
+inline uint64_t ATTRIBUTE_ALWAYS_INLINE now_milliseconds() {
+#ifdef __linux__
+  struct timespec tp;
+  clock_gettime(CLOCK_MONOTONIC_COARSE, &tp);
+  return static_cast<uint64_t>(tp.tv_sec) * 1000ul + tp.tv_nsec / 1000000.0;
+#else
+  using namespace std::chrono;
+  return duration_cast<milliseconds>(now().time_since_epoch()).count();
+  ;
+#endif
+}
+
+inline uint32_t ATTRIBUTE_ALWAYS_INLINE now_ticks() {
+  return static_cast<uint32_t>((now_milliseconds() - SizeMap::progress_start_time) / 10.0);
+}
+}  // namespace time
+
 }  // namespace mesh
 
 // ------------------------------------------------------

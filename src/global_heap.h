@@ -59,12 +59,30 @@ private:
   atomic_size_t _epoch{0};
 };
 
+class MiniHeapAliveStats {
+public:
+  double totalAlive{0};
+  size_t maxAlive{0};
+  size_t freeCount{0};
+  internal::SpinLockType lock{};
+
+  void Record(uint32_t alive) {
+    lock_guard<internal::SpinLockType> lockg(lock);
+    totalAlive += alive;
+    ++freeCount;
+    if (alive > maxAlive) {
+      maxAlive = alive;
+    }
+  }
+};
+
 class GlobalHeapStats {
 public:
   atomic_size_t meshCount;
   atomic_size_t mhFreeCount;
   atomic_size_t mhAllocCount;
   atomic_size_t mhHighWaterMark;
+  MiniHeapAliveStats alives[kNumBins + 1];
 };
 
 class CentralCache {
@@ -126,7 +144,7 @@ public:
     return true;
   }
 
-  bool pop_timeout(void *&head, void *&tail, uint32_t &size, uint64_t deadline) {
+  bool pop_timeout(void *&head, void *&tail, uint32_t &size, uint64_t timeout) {
     lock_guard<internal::SpinLockType> lock(_lock);
     if (_writeIndex - _readIndex < kMinCentralCacheLength) {
       return false;
@@ -134,6 +152,7 @@ public:
     d_assert(_writeIndex > _readIndex);
     const auto popIndex = _readIndex % kMaxCentralCacheLength;
     MeshEntry &cache = _cache[popIndex];
+    const auto deadline = time::now_milliseconds() - std::max(timeout / (_writeIndex - _readIndex), 100ul);
     if (cache.timestamp > deadline) {
       return false;
     }
@@ -158,7 +177,87 @@ private:
   MeshEntry _cache[kMaxCentralCacheLength];
   uint32_t _readIndex{0};
   uint32_t _writeIndex{0};
+
   mutable internal::SpinLockType _lock{};
+} CACHELINE_ALIGNED;
+
+class MiniheapFreeList {
+public:
+  MiniheapFreeList() {
+  }
+  class FreeListEntry {
+  public:
+    MiniHeapListEntry head{list::Head, list::Head};
+    size_t size{0};
+  };
+
+  inline FreeListEntry *freelistFor(uint8_t freelistId) {
+    switch (freelistId) {
+    case list::Empty:
+      return &empty;
+    case list::Partial:
+      return &partial;
+    case list::PartialFull:
+      return &partialFull;
+    case list::Full:
+      return &full;
+    }
+    // remaining case is 'attached', for which there is no freelist
+    return nullptr;
+  }
+
+  inline bool postFreeLocked(MiniHeap *mh, int sizeClass, size_t inUse) {
+    const auto currFreelistId = mh->freelistId();
+    auto currFreelist = freelistFor(currFreelistId);
+    const auto max = mh->maxCount();
+
+    FreeListEntry *list;
+    uint8_t newListId;
+
+    if (inUse == 0) {
+      // if the miniheap is already in the right list there is nothing to do
+      if (currFreelistId == list::Empty) {
+        return false;
+      }
+      newListId = list::Empty;
+      list = &empty;
+    } else if (inUse == max) {
+      if (currFreelistId == list::Full) {
+        return false;
+      }
+      newListId = list::Full;
+      list = &full;
+    } else {
+      if (inUse < SizeMap::OccupancyCutoffForClass(sizeClass)) {
+        newListId = list::Partial;
+        list = &partial;
+      } else {
+        newListId = list::PartialFull;
+        list = &partialFull;
+      }
+      if (currFreelistId == newListId) {
+        return false;
+      }
+    }
+
+    MiniHeapListEntry *currListHead = nullptr;
+    if (mh->getFreelist()->next().hasValue()) {
+      currListHead = &currFreelist->head;
+      d_assert(currFreelist->size > 0);
+      currFreelist->size--;
+    }
+    list->head.add(currListHead, newListId, list::Head, mh);
+    list->size++;
+
+    return empty.size > kBinnedTrackerMaxEmpty;
+  }
+
+  FreeListEntry empty{};
+  FreeListEntry partial{};
+  FreeListEntry partialFull{};
+  FreeListEntry full{};
+
+  mutable mutex lock{};
 } CACHELINE_ALIGNED;
 
 class GlobalHeap : public MeshableArena {
@@ -191,7 +290,7 @@ public:
 
   inline void flushAllBins() {
     for (size_t sizeClass = 0; sizeClass < kNumBins; sizeClass++) {
-      lock_guard<mutex> lock(_freelistLock[sizeClass]);
+      lock_guard<mutex> lock(_freelist[sizeClass].lock);
       flushBinLocked(sizeClass);
     }
   }
@@ -250,17 +349,8 @@ public:
     return ptr;
   }
 
-  inline std::pair<MiniHeapListEntry, size_t> *freelistFor(uint8_t freelistId, int sizeClass) {
-    switch (freelistId) {
-    case list::Empty:
-      return &_emptyFreelist[sizeClass];
-    case list::Partial:
-      return &_partialFreelist[sizeClass];
-    case list::Full:
-      return &_fullList[sizeClass];
-    }
-    // remaining case is 'attached', for which there is no freelist
-    return nullptr;
+  inline MiniheapFreeList::FreeListEntry *freelistFor(uint8_t freelistId, size_t sizeClass) {
+    return _freelist[sizeClass].freelistFor(freelistId);
   }
 
   inline bool postFreeLocked(MiniHeap *mh, int sizeClass, size_t inUse) {
@@ -269,51 +359,14 @@ public:
     if (mh->isAttached()) {
       return false;
     }
-    const auto currFreelistId = mh->freelistId();
-    auto currFreelist = freelistFor(currFreelistId, sizeClass);
-    const auto max = mh->maxCount();
-
-    std::pair<MiniHeapListEntry, size_t> *list;
-    uint8_t newListId;
-
-    if (inUse == 0) {
-      // if the miniheap is already in the right list there is nothing to do
-      if (currFreelistId == list::Empty) {
-        return false;
-      }
-      newListId = list::Empty;
-      list = &_emptyFreelist[sizeClass];
-    } else if (inUse == max) {
-      if (currFreelistId == list::Full) {
-        return false;
-      }
-      newListId = list::Full;
-      list = &_fullList[sizeClass];
-    } else {
-      if (currFreelistId == list::Partial) {
-        return false;
-      }
-      newListId = list::Partial;
-      list = &_partialFreelist[sizeClass];
-    }
-
-    MiniHeapListEntry *currListHead = nullptr;
-    if (mh->getFreelist()->next().hasValue()) {
-      currListHead = &currFreelist->first;
-      d_assert(currFreelist->second > 0);
-      currFreelist->second--;
-    }
-    // more chance to reuse
-    list->first.add(currListHead, newListId, list::Head, mh);
-    list->second++;
-
-    return _emptyFreelist[sizeClass].second > kBinnedTrackerMaxEmpty;
+    d_assert(!mh->isMeshed());
+    return _freelist[sizeClass].postFreeLocked(mh, sizeClass, inUse);
   }
 
   inline void releaseMiniheapLocked(MiniHeap *mh, int sizeClass) {
     // ensure this flag is always set with the miniheap lock held
     mh->unsetAttached();
-    if (mh->hasMeshed() && mh->isPartialFree()) {
+    if (mh->isPartialFree()) {
       unboundMeshSlowly(mh);
     }
     const auto inUse = mh->inUseCount();
@@ -326,7 +379,7 @@ public:
       return;
     }
 
-    lock_guard<mutex> lock(_freelistLock[sizeClass]);
+    lock_guard<mutex> lock(_freelist[sizeClass].lock);
     for (auto mh : miniheaps) {
       releaseMiniheapLocked(mh, sizeClass);
     }
@@ -334,36 +387,29 @@ public:
   }
 
   template <uint32_t Size>
-  void fillFromList(FixedArray<MiniHeap, Size> &miniheaps, pid_t current,
-                    std::pair<MiniHeapListEntry, size_t> &freelist, uint32_t maxSize) {
-    if (freelist.first.empty()) {
+  void fillFromList(FixedArray<MiniHeap, Size> &miniheaps, pid_t current, MiniheapFreeList::FreeListEntry &freelist,
+                    uint32_t maxSize) {
+    if (freelist.head.empty()) {
       return;
     }
 
     d_assert(maxSize <= Size);
 
-    auto nextId = freelist.first.next();
+    auto nextId = freelist.head.next();
     while (nextId != list::Head && miniheaps.size() < maxSize) {
       auto mh = GetMiniHeap(nextId);
       d_assert(mh != nullptr);
       nextId = mh->getFreelist()->next();
 
-      // TODO: we can eventually remove this
-      d_assert(!(mh->isFull() || mh->isAttached() || mh->isMeshed()));
+      d_assert(!mh->isFull());
+      d_assert(!mh->isMeshed());
 
-      if (mh->hasMeshed() && mh->isPartialFree()) {
-        unboundMeshSlowly(mh);
-      }
-
-      // TODO: this is commented out to match a bug in the previous implementation;
-      // it turns out if you don't track bytes free and give more memory to the
-      // thread-local cache, things perform better!
       d_assert(!mh->isAttached());
-      mh->setAttached(current, &freelist.first);
-      d_assert(mh->isAttached() && mh->current() == current);
+      mh->setAttached(current, &freelist.head);
+      d_assert(mh->isAttached());
       miniheaps.append(mh);
-      d_assert(freelist.second > 0);
-      freelist.second--;
+      d_assert(freelist.size > 0);
+      --freelist.size;
     }
 
     return;
@@ -371,42 +417,43 @@ public:
 
   template <uint32_t Size>
   void selectForReuse(int sizeClass, FixedArray<MiniHeap, Size> &miniheaps, pid_t current) {
-    fillFromList(miniheaps, current, _partialFreelist[sizeClass], Size);
+    auto &freelist = _freelist[sizeClass];
 
-    if (miniheaps.size() >= 2 || miniheaps.full()) {
-      return;
+    if (freelist.partial.size % 2) {
+      fillFromList(miniheaps, current, freelist.partialFull, Size);
+      if (miniheaps.full()) {
+        return;
+      }
+      fillFromList(miniheaps, current, freelist.partial, Size);
+      if (miniheaps.size() >= 2 || miniheaps.full()) {
+        return;
+      }
+    } else {
+      fillFromList(miniheaps, current, freelist.partial, Size);
+      if (miniheaps.size() >= 2 || miniheaps.full()) {
+        return;
+      }
+      fillFromList(miniheaps, current, freelist.partialFull, Size);
+      if (miniheaps.full()) {
+        return;
+      }
     }
 
     // we've exhausted all of our partially full MiniHeaps, but there
     // might still be empty ones we could reuse.
-    fillFromList(miniheaps, current, _emptyFreelist[sizeClass], miniheaps.size() + 1);
+    fillFromList(miniheaps, current, freelist.empty, miniheaps.size() + 1);
   }
 
-  template <uint32_t Size>
-  bool allocCache(int sizeClass, void *&head, void *&tail, uint32_t &size, FixedArray<MiniHeap, Size> &miniheaps,
-                  pid_t current) {
-    CentralCache &cache = _cache[sizeClass];
-    if (cache.pop(head, tail, size)) {
-      return true;
-    } else {
-      uint32_t objectSize = SizeMap::ByteSizeForClass(sizeClass);
-      allocSmallMiniheaps(sizeClass, objectSize, miniheaps, current);
-      return false;
-    }
-  }
+  bool allocFromCentralCache(int sizeClass, void *&head, void *&tail, uint32_t &size);
   void releaseToCentralCache(int sizeClass, void *head, void *tail, uint32_t size, pid_t current);
-  void flushCentralCache(size_t sizeClass);
+  void flushCentralCache();
+  size_t flushCentralCache(size_t sizeClass, size_t limit);
 
   template <uint32_t Size>
   inline void allocSmallMiniheaps(int sizeClass, uint32_t objectSize, FixedArray<MiniHeap, Size> &miniheaps,
                                   pid_t current) {
-    lock_guard<mutex> lock(_freelistLock[sizeClass]);
-    allocSmallMiniheapsLocked(sizeClass, objectSize, miniheaps, current);
-  }
+    lock_guard<mutex> lock(_freelist[sizeClass].lock);
 
-  template <uint32_t Size>
-  inline void allocSmallMiniheapsLocked(int sizeClass, uint32_t objectSize, FixedArray<MiniHeap, Size> &miniheaps,
-                                        pid_t current) {
     d_assert(objectSize <= _maxObjectSize);
 
 #ifndef NDEBUG
@@ -435,7 +482,7 @@ public:
     auto mh = allocMiniheapLocked(sizeClass, pageCount, objectCount, objectSize);
     d_assert(!mh->isAttached());
     mh->setAttached(current, nullptr);
-    d_assert(mh->isAttached() && mh->current() == current);
+    d_assert(mh->isAttached());
     miniheaps.append(mh);
 
     return;
@@ -468,9 +515,9 @@ public:
     // mesh::debug("%p (%u) untracked!\n", mh, GetMiniHeapID(mh));
     _stats.mhAllocCount -= 1;
     auto currFreelist = freelistFor(mh->freelistId(), mh->sizeClass());
-    d_assert(currFreelist && currFreelist->second > 0);
-    mh->getFreelist()->remove(&currFreelist->first);
-    currFreelist->second--;
+    d_assert(currFreelist && currFreelist->size > 0);
+    mh->getFreelist()->remove(&currFreelist->head);
+    currFreelist->size--;
   }
 
   void freeFor(MiniHeap *mh, void *ptr, size_t startEpoch);
@@ -480,6 +527,10 @@ public:
     // don't untrack a meshed miniheap -- it has already been untracked
     if (untrack && !mh->isMeshed()) {
       untrackMiniheapLocked(mh);
+    }
+
+    if (kEnableRecordMiniheapAlive) {
+      _stats.alives[mh->sizeClass()].Record(time::now_ticks() - mh->age());
     }
 
     d_assert(!mh->getFreelist()->prev().hasValue());
@@ -525,22 +576,23 @@ public:
   // flushBinLocked empties _emptyFreelist[sizeClass]
   inline void flushBinLocked(size_t sizeClass) {
     // mesh::debug("flush bin %zu\n", sizeClass);
-    d_assert(!_emptyFreelist[sizeClass].first.empty());
-    if (_emptyFreelist[sizeClass].first.next() == list::Head) {
+
+    auto &empty = _freelist[sizeClass].empty;
+    d_assert(!empty.head.empty());
+    if (empty.head.next() == list::Head) {
       return;
     }
 
-    std::pair<MiniHeapListEntry, size_t> &empty = _emptyFreelist[sizeClass];
-    MiniHeapID nextId = empty.first.next();
+    MiniHeapID nextId = empty.head.next();
     while (nextId != list::Head) {
       auto mh = GetMiniHeap(nextId);
       nextId = mh->getFreelist()->next();
       freeMiniheapLocked(mh, true);
     }
 
-    d_assert(empty.second == 0);
-    d_assert(empty.first.next() == list::Head);
-    d_assert(empty.first.prev() == list::Head);
+    d_assert(empty.size == 0);
+    d_assert(empty.head.next() == list::Head);
+    d_assert(empty.head.prev() == list::Head);
   }
 
   void ATTRIBUTE_NEVER_INLINE free(void *ptr);
@@ -667,7 +719,7 @@ public:
     // FIXME: duplicated with code in halfSplit
     internal::vector<MiniHeap *> bucket{};
 
-    auto nextId = _partialFreelist[sizeClass].first.next();
+    auto nextId = _freelist[sizeClass].partial.head.next();
     while (nextId != list::Head) {
       auto mh = GetMiniHeap(nextId);
       if (mh->isMeshingCandidate() && (mh->fullness() < kOccupancyCutoff)) {
@@ -703,18 +755,8 @@ private:
   // cachline aligned to avoid sharing cacheline with _meshEpoch
   atomic_size_t ATTRIBUTE_ALIGNED(CACHELINE_SIZE) _miniheapCount{0};
 
-  // these must only be accessed or modified with the _miniheapLock held
-  std::array<std::pair<MiniHeapListEntry, size_t>, kNumBins> _emptyFreelist{
-      Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head,
-      Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head};
-  std::array<std::pair<MiniHeapListEntry, size_t>, kNumBins> _partialFreelist{
-      Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head,
-      Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head};
-  std::array<std::pair<MiniHeapListEntry, size_t>, kNumBins> _fullList{
-      Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head,
-      Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head, Head};
+  MiniheapFreeList _freelist[kNumBins];
 
-  mutable mutex ATTRIBUTE_ALIGNED(CACHELINE_SIZE) _freelistLock[kNumBins];
   mutable mutex _miniheapLock{};
 
   GlobalHeapStats _stats{};

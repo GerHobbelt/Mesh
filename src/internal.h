@@ -95,7 +95,8 @@ static constexpr uint8_t Full = 0;
 static constexpr uint8_t Partial = 1;
 static constexpr uint8_t Empty = 2;
 static constexpr uint8_t Attached = 3;
-static constexpr uint8_t Max = 4;
+static constexpr uint8_t PartialFull = 4;
+static constexpr uint8_t Max = 5;
 }  // namespace list
 
 class MiniHeap;

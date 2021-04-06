@@ -443,20 +443,20 @@ static size_t flushSpansByOffset(internal::vector<Span> freeSpans[kSpanClassCoun
     if (spans.empty())
       continue;
 
-    internal::vector<Span> rest;
-    rest.reserve(spans.size());
-
-    for (auto &span : spans) {
+    const auto size = spans.size();
+    size_t left = 0;
+    for (size_t i = 0; i < size; ++i) {
+      auto &span = spans[i];
       if (offsetBegin <= span.offset && span.offset < offsetEnd) {
         flushSpans.emplace_back(span);
         freeCount += span.length;
       } else {
-        rest.emplace_back(span);
+        spans[left] = span;
+        ++left;
       }
     }
-    spans.swap(rest);
+    spans.resize(left);
   }
-
   return freeCount;
 }
 
@@ -581,12 +581,19 @@ void MeshableArena::dumpSpans() {
         dirty * 4.0 / 1024, clean, clean * 4.0 / 1024);
 }
 
+void MeshableArena::releaseToReset() {
+  // debug("_toReset size: %d", _toReset.size());
+  internal::FreeCmd *unmapCommand = new internal::FreeCmd(internal::FreeCmd::UNMAP_PAGE);
+  unmapCommand->spans.swap(_toReset);
+  _toReset.reserve(1024);
+  tryAndSendToFreeLocked(unmapCommand);
+}
+
 void MeshableArena::partialScavenge() {
   if (_dirtyPageCount < kMaxDirtyPageThreshold) {
     return;
   }
   size_t needFreeCount = _end / 5;
-
   internal::FreeCmd *freeCommand = new internal::FreeCmd(internal::FreeCmd::FREE_DIRTY_PAGE);
   size_t freeCount = flushSpansByOffset(_dirty, freeCommand->spans, _lastFlushBegin, needFreeCount);
 
@@ -606,26 +613,9 @@ void MeshableArena::scavenge(bool force) {
     return;
   }
 
-  internal::FreeCmd *unmapCommand = new internal::FreeCmd(internal::FreeCmd::UNMAP_PAGE);
-
-  auto markPages = [&](const Span &span) {
-    // debug("arena:  (%zu/%zu) \n", span.offset, span.length);
-    unmapCommand->spans.emplace_back(span);
-  };
-
-  // first, untrack the spans in the meshed bitmap and mark them in
-  // the (method-local) unallocated bitmap
-  std::for_each(_toReset.begin(), _toReset.end(), [&](const Span &span) {
-    markPages(span);
-    // resetSpanMapping(span);
-  });
-
-  // now that we've finally reset to identity all delayed-reset
-  // mappings, empty the list
-  // debug("_toReset size: %d", _toReset.size());
-  _toReset.clear();
-
-  tryAndSendToFreeLocked(unmapCommand);
+  if (!_toReset.empty()) {
+    releaseToReset();
+  }
 
   internal::FreeCmd *freeCommand = new internal::FreeCmd(internal::FreeCmd::FREE_DIRTY_PAGE);
 

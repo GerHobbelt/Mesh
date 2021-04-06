@@ -21,6 +21,7 @@ private:
 
   static_assert(maxCount <= (1 << 30), "expected maxCount <= 2^30");
   static_assert(allocSize % 2 == 0, "expected allocSize to be even");
+  static_assert(allocSize >= sizeof(void *), "expected allocSize >= 8");
 
 public:
   // cacheline-sized alignment
@@ -29,23 +30,20 @@ public:
   CheapHeap() : SuperHeap() {
     // TODO: check allocSize + maxCount doesn't overflow?
     _arena = reinterpret_cast<char *>(SuperHeap::thp_malloc(allocSize * maxCount));
-    _freelist = reinterpret_cast<void **>(SuperHeap::thp_malloc(maxCount * sizeof(void *)));
+    _arenaDodump = _arena;
     hard_assert(_arena != nullptr);
-    hard_assert(_freelist != nullptr);
     d_assert(reinterpret_cast<uintptr_t>(_arena) % Alignment == 0);
-    d_assert(reinterpret_cast<uintptr_t>(_freelist) % Alignment == 0);
 
     if (kAdviseDump) {
       madvise(_arena, allocSize * maxCount, MADV_DONTDUMP | (kAdviseHugePage ? MADV_HUGEPAGE : 0));
-      madvise(_freelist, maxCount * sizeof(void *), MADV_DONTDUMP | (kAdviseHugePage ? MADV_HUGEPAGE : 0));
     }
   }
 
   inline void *alloc() {
     lock_guard<HL::SpinLockType> lock(_lock);
-    if (likely(_freelistOff >= 0)) {
-      const auto ptr = _freelist[_freelistOff];
-      _freelistOff--;
+    if (likely(_freelist != nullptr)) {
+      auto ptr = _freelist;
+      _freelist = *reinterpret_cast<void **>(ptr);
       return ptr;
     }
 
@@ -53,14 +51,11 @@ public:
     const auto ptr = ptrFromOffset(off);
 
     if (kAdviseDump) {
-      // only call madvise at a new page
-      if ((uint64_t)ptr % kPageSize == 0) {
-        madvise(ptr, kPageSize, MADV_DODUMP | (kAdviseHugePage ? MADV_HUGEPAGE : 0));
-      }
-
-      void *freelistPage = _freelist + off * sizeof(void *);
-      if ((uint64_t)freelistPage % kPageSize == 0) {
-        madvise(freelistPage, kPageSize, MADV_DODUMP | (kAdviseHugePage ? MADV_HUGEPAGE : 0));
+      if (ptr + allocSize > _arenaDodump) {
+        size_t len = (ptr + allocSize - _arenaDodump + kPageSize - 1) & (~kPageMask);
+        madvise(_arenaDodump, len, MADV_DODUMP);
+        _arenaDodump += len;
+        // debug("ptr -> madvise(%p, %zu, MADV_DODUMP) %zu\n", ptr, len, allocSize);
       }
     }
 
@@ -77,8 +72,8 @@ public:
     d_assert(ptr >= _arena);
     d_assert(ptr < arenaEnd());
 
-    _freelistOff++;
-    _freelist[_freelistOff] = ptr;
+    *reinterpret_cast<void **>(ptr) = _freelist;
+    _freelist = ptr;
   }
 
   inline char *arenaBegin() const {
@@ -103,9 +98,9 @@ public:
 
 protected:
   char *_arena{nullptr};
-  void **_freelist{nullptr};
-  size_t _arenaOff{1};
-  ssize_t _freelistOff{-1};
+  char *_arenaDodump{nullptr};
+  void *_freelist{nullptr};
+  size_t _arenaOff{1};  // can't set to zero, we need MiniHeapId > 0
   mutable HL::SpinLockType _lock{};
 };
 

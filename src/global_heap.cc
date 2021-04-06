@@ -101,7 +101,7 @@ void GlobalHeap::freeFor(MiniHeap *mh, void *ptr, size_t startEpoch) {
   if (startEpoch % 2 == 1 || !_meshEpoch.isSame(startEpoch)) {
     // a mesh was started in between when we looked up our miniheap
     // and now.  synchronize to avoid races
-    lock_guard<mutex> lock(_freelistLock[sizeClass]);
+    lock_guard<mutex> lock(_freelist[sizeClass].lock);
 
     if (mh->createEpoch() != createEpoch) {
       return;
@@ -115,7 +115,7 @@ void GlobalHeap::freeFor(MiniHeap *mh, void *ptr, size_t startEpoch) {
       if (unlikely(mh != origMh)) {
         hard_assert(!mh->isMeshed());
         if (origMh->meshedFree(off)) {
-          mh->setPartialFree();
+          unboundMeshSlowly(mh);
         }
         if (!wasSet) {
           // we have confirmation that we raced with meshing, so free the pointer
@@ -133,7 +133,8 @@ void GlobalHeap::freeFor(MiniHeap *mh, void *ptr, size_t startEpoch) {
     freelistId = mh->freelistId();
     isAttached = mh->isAttached();
 
-    if (!isAttached && (remaining == 0 || freelistId == list::Full)) {
+    if (!isAttached && (remaining == 0 || freelistId == list::Full ||
+                        (freelistId == list::PartialFull && remaining < SizeMap::OccupancyCutoffForClass(sizeClass)))) {
       // this may free the miniheap -- we can't safely access it after
       // this point.
       const bool shouldFlush = postFreeLocked(mh, sizeClass, remaining);
@@ -145,11 +146,20 @@ void GlobalHeap::freeFor(MiniHeap *mh, void *ptr, size_t startEpoch) {
   } else {
     // the free went through ok; if we _were_ full, or now _are_ empty,
     // make sure to update the littleheaps
-    if (!isAttached && (remaining == 0 || freelistId == list::Full)) {
-      lock_guard<mutex> lock(_freelistLock[sizeClass]);
+    if (!isAttached && (remaining == 0 || freelistId == list::Full ||
+                        (freelistId == list::PartialFull && remaining < SizeMap::OccupancyCutoffForClass(sizeClass)))) {
+      lock_guard<mutex> lock(_freelist[sizeClass].lock);
 
       if (mh->createEpoch() != createEpoch) {
         return;
+      }
+      if (mh->isMeshed()) {
+        d_assert(wasSet);
+        return;
+      }
+      if (mh->isPartialFree()) {
+        d_assert(mh->hasMeshed());
+        unboundMeshSlowly(mh);
       }
 
       // a lot could have happened between when we read this without
@@ -224,6 +234,7 @@ void GlobalHeap::meshLocked(MiniHeap *dst, MiniHeap *&src, internal::vector<Span
   // mesh::debug("mesh dst:%p <- src:%p\n", dst, src);
   // dst->dumpDebug();
   // src->dumpDebug();
+  d_assert(src->freelistId() == list::Partial);
   untrackMiniheapLocked(src);
 
   const size_t dstSpanSize = dst->spanSize();
@@ -311,8 +322,10 @@ size_t GlobalHeap::meshSizeClassLocked(size_t sizeClass, MergeSetArray &mergeSet
   // }
   //
 
-  flushCentralCache(sizeClass);
-  lock_guard<mutex> lock(_freelistLock[sizeClass]);
+  flushCentralCache(sizeClass, 5000u);
+
+  auto &freelist = _freelist[sizeClass];
+  lock_guard<mutex> lock(_freelist[sizeClass].lock);
 
   auto meshFound =
       function<bool(std::pair<MiniHeap *, MiniHeap *> &&)>([&](std::pair<MiniHeap *, MiniHeap *> &&miniheaps) {
@@ -323,7 +336,7 @@ size_t GlobalHeap::meshSizeClassLocked(size_t sizeClass, MergeSetArray &mergeSet
         return mergeSetCount < kMaxMergeSets;
       });
 
-  method::shiftedSplitting(_fastPrng, sizeClass, &_partialFreelist[sizeClass].first, all, meshFound);
+  method::shiftedSplitting(_fastPrng, &freelist.partial.head, all, meshFound);
 
   if (mergeSetCount == 0) {
     // debug("nothing to mesh. sizeClass = %d", sizeClass);
@@ -376,7 +389,10 @@ size_t GlobalHeap::meshSizeClassLocked(size_t sizeClass, MergeSetArray &mergeSet
     }
 
     if (!oneEmpty && !aboveMeshThreshold()) {
-      if (dstCount < srcCount || (dstCount == srcCount && dstUseCount > srcUseCount)) {
+      // if (dstCount < srcCount || (dstCount == srcCount && dstUseCount > srcUseCount)) {
+      dstUseCount += dstCount;
+      srcUseCount += srcCount;
+      if (dstUseCount > srcUseCount || (dstUseCount == srcUseCount && dst->age() < src->age())) {
         std::swap(dst, src);
       }
       meshLocked(dst, src, fCommand->spans);
@@ -389,6 +405,7 @@ size_t GlobalHeap::meshSizeClassLocked(size_t sizeClass, MergeSetArray &mergeSet
   // of mesh above)
   flushBinLocked(sizeClass);
 
+  SizeMap::SetOccupancyCutoff(sizeClass, freelist.partial.size);
   return meshCount;
 }
 
@@ -516,45 +533,69 @@ void GlobalHeap::dumpList(int level) {
   for (size_t sizeClass = 0; sizeClass < kNumBins; ++sizeClass) {
     const auto pages = SizeMap::SizeClassToPageCount(sizeClass);
     {
-      lock_guard<mutex> lock(_freelistLock[sizeClass]);
-      const auto &freelist = _partialFreelist[sizeClass];
-      if (freelist.second) {
+      lock_guard<mutex> lock(_freelist[sizeClass].lock);
+      const auto &freelist = _freelist[sizeClass].partial;
+      if (freelist.size) {
         if (level > 0) {
-          dumpMiniHeaps("MeshPartialList ----", sizeClass, &freelist.first, level);
+          dumpMiniHeaps("MeshPartialList ----", sizeClass, &freelist.head, level);
         }
-        debug("MeshPartialList ++++++ class:%-2zu, length:%-6zu(%.2f(MB))", sizeClass, freelist.second,
-              freelist.second * pages * 4.0 / 1024.0);
+        debug("MeshPartialList ++++++ class:%-2zu, length:%-6zu(%.2f(MB))", sizeClass, freelist.size,
+              freelist.size * pages * 4.0 / 1024.0);
       }
     }
     {
-      lock_guard<mutex> lock(_freelistLock[sizeClass]);
-      const auto &freelist = _fullList[sizeClass];
-      if (freelist.second) {
+      lock_guard<mutex> lock(_freelist[sizeClass].lock);
+      const auto &freelist = _freelist[sizeClass].partialFull;
+      if (freelist.size) {
         if (level > 0) {
-          dumpMiniHeaps("MeshFullList -------", sizeClass, &freelist.first, level);
+          dumpMiniHeaps("MeshParFullList ----", sizeClass, &freelist.head, level);
         }
-        debug("MeshFullList +++++++++ class:%-2zu, length:%-6zu(%.2f(MB))", sizeClass, freelist.second,
-              freelist.second * pages * 4.0 / 1024.0);
+        debug("MeshParfullList ++++++ class:%-2zu, length:%-6zu(%.2f(MB))", sizeClass, freelist.size,
+              freelist.size * pages * 4.0 / 1024.0);
       }
     }
     {
-      lock_guard<mutex> lock(_freelistLock[sizeClass]);
-      const auto &freelist = _emptyFreelist[sizeClass];
-      if (freelist.second) {
-        debug("MeshEmptyList ++++++++ class:%-2zu, length:%-6zu(%.2f(MB))", sizeClass, freelist.second,
-              freelist.second * pages * 4.0 / 1024.0);
+      lock_guard<mutex> lock(_freelist[sizeClass].lock);
+      const auto &freelist = _freelist[sizeClass].full;
+      if (freelist.size) {
+        if (level > 0) {
+          dumpMiniHeaps("MeshFullList -------", sizeClass, &freelist.head, level);
+        }
+        debug("MeshFullList +++++++++ class:%-2zu, length:%-6zu(%.2f(MB))", sizeClass, freelist.size,
+              freelist.size * pages * 4.0 / 1024.0);
+      }
+    }
+    {
+      lock_guard<mutex> lock(_freelist[sizeClass].lock);
+      const auto &freelist = _freelist[sizeClass].empty;
+      if (freelist.size) {
+        debug("MeshEmptyList ++++++++ class:%-2zu, length:%-6zu(%.2f(MB))", sizeClass, freelist.size,
+              freelist.size * pages * 4.0 / 1024.0);
       }
     }
   }
-  {
+  if (level > 0) {
     for (size_t i = 0; i < kNumBins; ++i) {
       debug("MeshCentralCache --+++++ class:%-2zu, length: %-3zu (%.2f(MB))", i, _cache[i].size(),
             _cache[i].totalCache() * SizeMap::ByteSizeForClass(i) / 1024.0 / 1024.0);
     }
   }
+  if (kEnableRecordMiniheapAlive && level > 0) {
+    for (size_t i = 0; i < kNumBins + 1; ++i) {
+      auto &alive = _stats.alives[i];
+      lock_guard<internal::SpinLockType> lockg(alive.lock);
+      debug("MeshAlive ---------+++++ class:%-2zu, totalFreeCount: %6zu, Alive(avg/max): %.2f/%.2f (seconds)", i,
+            alive.freeCount, (alive.totalAlive / 100.0 / std::max(1ul, alive.freeCount)), alive.maxAlive / 100.0);
+    }
+  }
   if (level > 0) {
     dumpSpans();
   }
+}
+
+bool GlobalHeap::allocFromCentralCache(int sizeClass, void *&head, void *&tail, uint32_t &size) {
+  CentralCache &cache = _cache[sizeClass];
+  return cache.pop(head, tail, size);
 }
 
 void GlobalHeap::releaseToCentralCache(int sizeClass, void *head, void *tail, uint32_t size, pid_t current) {
@@ -576,21 +617,29 @@ void GlobalHeap::releaseToCentralCache(int sizeClass, void *head, void *tail, ui
   maybeMesh();
 }
 
-void GlobalHeap::flushCentralCache(size_t sizeClass) {
+void GlobalHeap::flushCentralCache() {
+  size_t totalSize = 0;
   bool shouldMesh = false;
-  if (!sizeClass) {
+  for (int i = 0; i < 5 && totalSize < 1000; ++i) {
     const auto old = _lastFreeClass.fetch_add(1);
-    sizeClass = old % kNumBins;
-    shouldMesh = old % 8 == 0;
+    size_t sizeClass = old % kNumBins;
+    totalSize += flushCentralCache(sizeClass, 1000u);
+    if (old % 8 == 0) {
+      shouldMesh = true;
+    }
   }
+  if (shouldMesh || totalSize) {
+    maybeMesh();
+  }
+}
+
+size_t GlobalHeap::flushCentralCache(size_t sizeClass, size_t limit) {
   void *head = nullptr;
   void *tail = nullptr;
   uint32_t size = 0;
   size_t totalSize = 0;
   CentralCache &cache = _cache[sizeClass];
-
-  uint64_t deadline = time::now_milliseconds() - _flushCentralCacheDelay;
-  while (totalSize < 1000 && cache.pop_timeout(head, tail, size, deadline)) {
+  while (totalSize < limit && cache.pop_timeout(head, tail, size, _flushCentralCacheDelay)) {
     while (head) {
       void *tmp = *reinterpret_cast<void **>(head);
       free(head);
@@ -598,32 +647,22 @@ void GlobalHeap::flushCentralCache(size_t sizeClass) {
     }
     totalSize += size;
   }
-  if (shouldMesh) {
-    maybeMesh();
-  }
+  return totalSize;
 }
 
 namespace method {
 
-void ATTRIBUTE_NEVER_INLINE halfSplit(MWC &prng, size_t sizeClass, MiniHeapListEntry *miniheaps, SplitArray &all,
-                                      size_t &leftSize, size_t &rightSize) noexcept {
+void ATTRIBUTE_NEVER_INLINE halfSplit(MWC &prng, MiniHeapListEntry *miniheaps, SplitArray &all, size_t &leftSize,
+                                      size_t &rightSize) noexcept {
   d_assert(leftSize == 0);
   d_assert(rightSize == 0);
 
   size_t allSize = 0;
-  size_t fullness = std::min(SizeMap::ObjectCountForClass(sizeClass), 64u);
-  fullness = fullness * kOccupancyCutoff;
-
   MiniHeapID mhId = miniheaps->next();
   while (mhId != list::Head && allSize < kMaxSplitListSize * 2) {
     auto mh = GetMiniHeap(mhId);
     mhId = mh->getFreelist()->next();
-
     d_assert(mh->isMeshingCandidate());
-    if (mh->inUseCount1() >= fullness) {
-      continue;
-    }
-
     all[allSize] = mh;
     ++allSize;
   }
@@ -635,7 +674,7 @@ void ATTRIBUTE_NEVER_INLINE halfSplit(MWC &prng, size_t sizeClass, MiniHeapListE
 }
 
 void ATTRIBUTE_NEVER_INLINE
-shiftedSplitting(MWC &prng, size_t sizeClass, MiniHeapListEntry *miniheaps, SplitArray &all,
+shiftedSplitting(MWC &prng, MiniHeapListEntry *miniheaps, SplitArray &all,
                  const function<bool(std::pair<MiniHeap *, MiniHeap *> &&)> &meshFound) noexcept {
   constexpr size_t t = 64;
 
@@ -649,7 +688,7 @@ shiftedSplitting(MWC &prng, size_t sizeClass, MiniHeapListEntry *miniheaps, Spli
   size_t leftSize = 0;
   size_t rightSize = 0;
 
-  halfSplit(prng, sizeClass, miniheaps, all, leftSize, rightSize);
+  halfSplit(prng, miniheaps, all, leftSize, rightSize);
 
   left = &all[0];
   right = left + leftSize;

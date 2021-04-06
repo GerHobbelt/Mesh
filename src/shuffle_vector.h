@@ -161,18 +161,32 @@ public:
 
     uint32_t allocCount = 0;
 
-    for (auto const &i : localBits) {
-      // FIXME: this incredibly lurky conditional is because
-      // RelaxedFixedBitmap iterates over all 256 bits it has,
-      // regardless of the _maxCount set in the constructor -- we
-      // should fix that.
-      if (i >= objectCount) {
-        break;
+    if (!kEnableShuffleOnInit) {
+      for (auto const &i : localBits) {
+        // FIXME: this incredibly lurky conditional is because
+        // RelaxedFixedBitmap iterates over all 256 bits it has,
+        // regardless of the _maxCount set in the constructor -- we
+        // should fix that.
+        if (i >= objectCount) {
+          break;
+        }
+        _cache->push(reinterpret_cast<void *>(start + i * objectSize));
+        ++allocCount;
       }
-      _cache->push(reinterpret_cast<void *>(start + i * objectSize));
-      ++allocCount;
+    } else {
+      void *ptr[256];
+      for (auto const &i : localBits) {
+        if (i >= objectCount) {
+          break;
+        }
+        ptr[allocCount] = reinterpret_cast<void *>(start + i * objectSize);
+        ++allocCount;
+      }
+      internal::mwcShuffle(&ptr[0], &ptr[allocCount], _prng);
+      for (size_t i = 0; i < allocCount; ++i) {
+        _cache->push(ptr[i]);
+      }
     }
-
     return allocCount;
   }
 

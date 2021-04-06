@@ -33,9 +33,9 @@ private:
   }
   static constexpr uint32_t SizeClassShift = 0;
   static constexpr uint32_t FreelistIdShift = 6;
-  // static constexpr uint32_t ShuffleVectorOffsetShift = 8;
-  static constexpr uint32_t MaxCountShift = 8;
-  static constexpr uint32_t EpochShift = 17;
+  static constexpr uint32_t MaxCountShift = 9;
+  static constexpr uint32_t EpochShift = 18;
+  static constexpr uint32_t AttachedOffset = 29;
   static constexpr uint32_t MeshedOffset = 30;
   static constexpr uint32_t PartialFreeOffset = 31;
 
@@ -53,7 +53,7 @@ public:
   explicit Flags(uint32_t maxCount, uint32_t sizeClass, uint32_t freelistId) noexcept
       : _flags{(maxCount << MaxCountShift) + (sizeClass << SizeClassShift) + (freelistId << FreelistIdShift) +
                (((_flags >> EpochShift) & 0x1f) << EpochShift)} {
-    d_assert((freelistId & 0x3) == freelistId);
+    d_assert((freelistId & 0x7) == freelistId);
     d_assert((sizeClass & ((1 << FreelistIdShift) - 1)) == sizeClass);
     // d_assert(svOffset < 255);
     d_assert_msg(sizeClass < 255, "sizeClass: %u", sizeClass);
@@ -62,13 +62,13 @@ public:
   }
 
   inline uint32_t freelistId() const {
-    return (_flags.load(std::memory_order_seq_cst) >> FreelistIdShift) & 0x3;
+    return (_flags.load(std::memory_order_seq_cst) >> FreelistIdShift) & 0x7;
   }
 
   inline void setFreelistId(uint32_t freelistId) {
     static_assert(list::Max <= (1 << FreelistIdShift), "expected max < 4");
     d_assert(freelistId < list::Max);
-    uint32_t mask = ~(static_cast<uint32_t>(0x3) << FreelistIdShift);
+    uint32_t mask = ~(static_cast<uint32_t>(0x7) << FreelistIdShift);
     uint32_t newVal = (static_cast<uint32_t>(freelistId) << FreelistIdShift);
     setMasked(mask, newVal);
   }
@@ -117,6 +117,18 @@ public:
     return is(PartialFreeOffset);
   }
 
+  inline void setAttached() {
+    set(AttachedOffset);
+  }
+
+  inline void unsetAttached() {
+    unset(AttachedOffset);
+  }
+
+  inline bool ATTRIBUTE_ALWAYS_INLINE isAttached() const {
+    return is(AttachedOffset);
+  }
+
 private:
   inline bool ATTRIBUTE_ALWAYS_INLINE is(size_t offset) const {
     const auto mask = getSingleBitMask(offset);
@@ -158,6 +170,7 @@ public:
   MiniHeap(void *arenaBegin, Span span, size_t objectCount, size_t objectSize)
       : _bitmap(objectCount),
         _span(span),
+        _age(time::now_ticks()),
         _flags(objectCount, objectCount > 1 ? SizeMap::SizeClass(objectSize) : kClassSizesMax, list::Attached),
         _objectSizeReciprocal(1.0 / (float)objectSize) {
     // debug("sizeof(MiniHeap): %zu", sizeof(MiniHeap));
@@ -329,11 +342,12 @@ public:
 
   inline void setAttached(pid_t current, MiniHeapListEntry *listHead) {
     // mesh::debug("MiniHeap(%p:%5zu): current <- %u\n", this, objectSize(), current);
-    _current.store(current, std::memory_order::memory_order_release);
     if (listHead != nullptr) {
       _freelist.remove(listHead);
     }
     this->setFreelistId(list::Attached);
+    d_assert(!_flags.isAttached());
+    _flags.setAttached();
   }
 
   inline uint8_t freelistId() const {
@@ -344,17 +358,18 @@ public:
     _flags.setFreelistId(id);
   }
 
-  inline pid_t current() const {
-    return _current.load(std::memory_order::memory_order_acquire);
+  inline uint32_t age() const {
+    return _age;
   }
 
   inline void unsetAttached() {
     // mesh::debug("MiniHeap(%p:%5zu): current <- UNSET\n", this, objectSize());
-    _current.store(0, std::memory_order::memory_order_release);
+    // _current.store(0, std::memory_order::memory_order_release);
+    _flags.unsetAttached();
   }
 
   inline bool isAttached() const {
-    return current() != 0;
+    return _flags.isAttached();
   }
 
   inline bool ATTRIBUTE_ALWAYS_INLINE isMeshed() const {
@@ -530,10 +545,11 @@ public:
   }
 
 protected:
-  internal::Bitmap _bitmap;           // 32 bytes 32
-  const Span _span;                   // 8        40
-  MiniHeapListEntry _freelist{};      // 8        48
-  atomic<pid_t> _current{0};          // 4        52
+  internal::Bitmap _bitmap;       // 32 bytes 32
+  const Span _span;               // 8        40
+  MiniHeapListEntry _freelist{};  // 8        48
+  // atomic<pid_t> _current{0};       // 4        52
+  uint32_t _age{0};                   // 4        52
   Flags _flags;                       // 4        56
   const float _objectSizeReciprocal;  // 4        60
   MiniHeapID _nextMeshed{};           // 4        64
