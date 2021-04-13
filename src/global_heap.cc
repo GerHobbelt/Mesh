@@ -474,10 +474,12 @@ void GlobalHeap::dumpStats(int level, bool beDetailed) const {
   if (level < 1)
     return;
 
+  const auto meshedPage = meshedPageCount();
   const auto meshedPageHWM = meshedPageHighWaterMark();
 
   debug("MESH COUNT:         %zu\n", (size_t)_stats.meshCount);
   debug("Meshed MB (total):  %.1f\n", (size_t)_stats.meshCount * 4096.0 / 1024.0 / 1024.0);
+  debug("Meshed pages:       %zu\n", meshedPage);
   debug("Meshed pages HWM:   %zu\n", meshedPageHWM);
   debug("Meshed MB HWM:      %.1f\n", meshedPageHWM * 4096.0 / 1024.0 / 1024.0);
   // debug("Peak RSS reduction: %.2f\n", rssSavings);
@@ -577,7 +579,7 @@ void GlobalHeap::dumpList(int level) {
   if (level > 0) {
     for (size_t i = 0; i < kNumBins; ++i) {
       debug("MeshCentralCache --+++++ class:%-2zu, length: %-3zu (%.2f(MB))", i, _cache[i].size(),
-            _cache[i].totalCache() * SizeMap::ByteSizeForClass(i) / 1024.0 / 1024.0);
+            _cache[i].size() * SizeMap::NumToMoveForClass(i) * SizeMap::ByteSizeForClass(i) / 1024.0 / 1024.0);
     }
   }
   if (kEnableRecordMiniheapAlive && level > 0) {
@@ -593,28 +595,25 @@ void GlobalHeap::dumpList(int level) {
   }
 }
 
-bool GlobalHeap::allocFromCentralCache(int sizeClass, void *&head, void *&tail, uint32_t &size) {
+bool GlobalHeap::allocFromCentralCache(int sizeClass, void *&head) {
   CentralCache &cache = _cache[sizeClass];
-  return cache.pop(head, tail, size);
+  return cache.pop(head);
 }
 
-void GlobalHeap::releaseToCentralCache(int sizeClass, void *head, void *tail, uint32_t size, pid_t current) {
+void GlobalHeap::releaseToCentralCache(int sizeClass, void *head, uint32_t size, pid_t current) {
   if (!size) {
     return;
   }
-  if (size <= SizeMap::NumToMoveForClass(sizeClass)) {
+  if (size == SizeMap::NumToMoveForClass(sizeClass)) {
     CentralCache &cache = _cache[sizeClass];
-    if (cache.push(head, tail, size)) {
+    if (cache.push(head)) {
       return;
     }
   }
-  void *tmp{nullptr};
-  while (head) {
-    tmp = *reinterpret_cast<void **>(head);
-    free(head);
-    head = tmp;
+  if (size > 0) {
+    freePtrList(head, size);
+    maybeMesh();
   }
-  maybeMesh();
 }
 
 void GlobalHeap::flushCentralCache() {
@@ -635,19 +634,25 @@ void GlobalHeap::flushCentralCache() {
 
 size_t GlobalHeap::flushCentralCache(size_t sizeClass, size_t limit) {
   void *head = nullptr;
-  void *tail = nullptr;
-  uint32_t size = 0;
   size_t totalSize = 0;
   CentralCache &cache = _cache[sizeClass];
-  while (totalSize < limit && cache.pop_timeout(head, tail, size, _flushCentralCacheDelay)) {
-    while (head) {
-      void *tmp = *reinterpret_cast<void **>(head);
-      free(head);
-      head = tmp;
-    }
+  while (totalSize < limit && cache.pop_timeout(head, _flushCentralCacheDelay)) {
+    size_t size = SizeMap::NumToMoveForClass(sizeClass);
+    freePtrList(head, size);
     totalSize += size;
   }
   return totalSize;
+}
+
+void GlobalHeap::freePtrList(void *head, size_t size) {
+  void *tmp{nullptr};
+  while (head) {
+    tmp = *reinterpret_cast<void **>(head);
+    free(head);
+    head = tmp;
+    --size;
+  }
+  d_assert(size == 0);
 }
 
 namespace method {

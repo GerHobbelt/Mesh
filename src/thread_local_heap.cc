@@ -132,14 +132,16 @@ void ThreadLocalHeap::DeleteHeap(ThreadLocalHeap *heap) {
 void ThreadLocalHeap::releaseAll() {
   for (size_t i = 1; i < kNumBins; i++) {
     ShuffleCache &shuffleCache = _shuffleCache[i];
-    void *head, *tail;
+    void *head;
     if (!shuffleCache.isExhausted()) {
       if (shuffleCache.length() > SizeMap::NumToMoveForClass(i)) {
-        uint32_t size = shuffleCache.pop_list(SizeMap::NumToMoveForClass(i), head, tail);
-        _global->releaseToCentralCache(i, head, tail, size, _current);
+        uint32_t size = shuffleCache.pop_list(SizeMap::NumToMoveForClass(i), head);
+        _global->releaseToCentralCache(i, head, size, _current);
       }
-      uint32_t size = shuffleCache.pop_list(shuffleCache.length(), head, tail);
-      _global->releaseToCentralCache(i, head, tail, size, _current);
+      uint32_t size = shuffleCache.pop_list(shuffleCache.length(), head);
+      if (size > 0) {
+        _global->releaseToCentralCache(i, head, size, _current);
+      }
       d_assert(shuffleCache.isExhausted());
       d_assert(!shuffleCache.length());
     }
@@ -148,10 +150,10 @@ void ThreadLocalHeap::releaseAll() {
 
 void CACHELINE_ALIGNED_FN ThreadLocalHeap::releaseToCentralCache(size_t sizeClass) {
   ShuffleCache &shuffleCache = _shuffleCache[sizeClass];
-  void *head, *tail;
-  uint32_t size = shuffleCache.pop_list(SizeMap::NumToMoveForClass(sizeClass), head, tail);
+  void *head;
+  uint32_t size = shuffleCache.pop_list(SizeMap::NumToMoveForClass(sizeClass), head);
   if (size) {
-    _global->releaseToCentralCache(sizeClass, head, tail, size, _current);
+    _global->releaseToCentralCache(sizeClass, head, size, _current);
     _freeCount = 0;
   }
 }
@@ -164,10 +166,10 @@ void CACHELINE_ALIGNED_FN ThreadLocalHeap::flushCentralCache() {
 // we get here if the shuffleVector is exhausted
 void *CACHELINE_ALIGNED_FN ThreadLocalHeap::smallAllocSlowpath(size_t sizeClass) {
   ShuffleCache &shuffleCache = _shuffleCache[sizeClass];
-  void *head, *tail;
-  uint32_t size;
-  if (_global->allocFromCentralCache(sizeClass, head, tail, size)) {
-    shuffleCache.push_list(head, tail, size);
+  void *head;
+  if (_global->allocFromCentralCache(sizeClass, head)) {
+    uint32_t size = SizeMap::NumToMoveForClass(sizeClass);
+    shuffleCache.push_list(head, size);
     return shuffleCache.malloc();
   } else {
     ShuffleVector &shuffleVector = _shuffleVector[sizeClass];

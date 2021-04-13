@@ -252,6 +252,10 @@ struct Span {
     return std::min(length, kSpanClassCount) - 1;
   }
 
+  uint32_t endOffset() const {
+    return offset + length - 1;
+  }
+
   size_t byteLength() const {
     return length * kPageSize;
   }

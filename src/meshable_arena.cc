@@ -53,10 +53,12 @@ MeshableArena::MeshableArena() : SuperHeap(), _fastPrng(internal::seed(), intern
   _arenaBegin = SuperHeap::map(kArenaSize, kMapShared, fd);
   _arenaEnd = reinterpret_cast<void *>((char *)(_arenaBegin) + kArenaSize);
 
-  _mhIndex = reinterpret_cast<atomic<size_t> *>(SuperHeap::malloc(indexSize()));
+  _mhIndex = reinterpret_cast<atomic<int32_t> *>(SuperHeap::malloc(indexSize() * sizeof(uint32_t)));
+  _clIndex = reinterpret_cast<atomic<uint8_t> *>(SuperHeap::malloc(indexSize()));
 
   hard_assert(_arenaBegin != nullptr);
   hard_assert(_mhIndex != nullptr);
+  hard_assert(_clIndex != nullptr);
 
   if (kAdviseDump) {
     madvise(_arenaBegin, kArenaSize, MADV_DONTDUMP);
@@ -183,10 +185,24 @@ void MeshableArena::expandArena(size_t minPagesAdded) {
     trackCOWed(expansion);
     resetSpanMapping(expansion);
   }
-  _clean[expansion.spanClass()].emplace_back(expansion);
+  freeCleanSpan(expansion);
   // debug("expandArena : %d, end=%d\n", minPagesAdded, _end);
 }
 
+void MeshableArena::narrowArena() {
+  if (_end < 1024u) {
+    return;
+  }
+  uint32_t spanClass, index;
+  getCleanIndex(_end - 1, spanClass, index);
+  if (spanClass < kSpanClassCount) {
+    Span left = popCleanSpan(spanClass, index);
+    clearCleanIndex(left);
+    _end -= left.length;
+  }
+}
+
+template <bool IsClean>
 bool MeshableArena::findPagesInner(internal::vector<Span> freeSpans[kSpanClassCount], const size_t i,
                                    const size_t pageCount, Span &result) {
   internal::vector<Span> &spanList = freeSpans[i];
@@ -195,22 +211,25 @@ bool MeshableArena::findPagesInner(internal::vector<Span> freeSpans[kSpanClassCo
 
   size_t __attribute__((__unused__)) oldLen = spanList.size();
 
-  if (i == kSpanClassCount - 1) {
-    // the final span class contains (and is the only class to
-    // contain) variable-size spans, so we need to make sure we
-    // search through all candidates in this case.
-    for (int64_t j = spanList.size() - 1; j > 0; --j) {
-      if (spanList[j].length >= pageCount) {
+  d_assert(i == kSpanClassCount - 1);
+  // the final span class contains (and is the only class to
+  // contain) variable-size spans, so we need to make sure we
+  // search through all candidates in this case.
+  for (int64_t j = spanList.size() - 1; j > 0; --j) {
+    if (spanList[j].length >= pageCount) {
+      if (IsClean) {
+        swapCleanSpan(i, j, spanList.size() - 1);
+      } else {
         std::swap(spanList[j], spanList.back());
-        break;
       }
+      break;
     }
+  }
 
-    // check that we found something in the above loop. this would be
-    // our last loop iteration anyway
-    if (spanList.back().length < pageCount) {
-      return false;
-    }
+  // check that we found something in the above loop. this would be
+  // our last loop iteration anyway
+  if (spanList.back().length < pageCount) {
+    return false;
   }
 
   Span span = spanList.back();
@@ -232,8 +251,12 @@ bool MeshableArena::findPagesInner(internal::vector<Span> freeSpans[kSpanClassCo
 
   auto ci = rest.spanClass();
   if (!rest.empty()) {
-    freeSpans[ci].emplace_back(rest);
-    moveBiggerTofirst(freeSpans[ci]);
+    if (IsClean) {
+      freeCleanSpan(rest);
+    } else {
+      freeSpans[ci].emplace_back(rest);
+      moveBiggerTofirst(freeSpans[ci]);
+    }
   }
   d_assert(span.length == pageCount);
 
@@ -241,6 +264,7 @@ bool MeshableArena::findPagesInner(internal::vector<Span> freeSpans[kSpanClassCo
   return true;
 }
 
+template <bool IsClean>
 bool MeshableArena::findPagesInnerFast(internal::vector<Span> freeSpans[kSpanClassCount], const size_t i,
                                        const size_t pageCount, Span &result) {
   internal::vector<Span> &spanList = freeSpans[i];
@@ -257,8 +281,11 @@ bool MeshableArena::findPagesInnerFast(internal::vector<Span> freeSpans[kSpanCla
   // put the part we don't need back in the reuse pile
   Span rest = span.splitAfter(pageCount);
   if (!rest.empty()) {
-    freeSpans[rest.spanClass()].emplace_back(rest);
-    moveBiggerTofirst(freeSpans[rest.spanClass()]);
+    if (IsClean) {
+      freeCleanSpan(rest);
+    } else {
+      freeSpans[rest.spanClass()].emplace_back(rest);
+    }
   }
   d_assert(span.length == pageCount);
 
@@ -271,14 +298,15 @@ bool MeshableArena::findPages(const size_t pageCount, Span &result, internal::Pa
 
   // search the fix length class first
   for (size_t i = targetClass; i < kSpanClassCount - 1; ++i) {
-    if (findPagesInnerFast(_dirty, i, pageCount, result)) {
+    if (findPagesInnerFast<false>(_dirty, i, pageCount, result)) {
       type = internal::PageType::Dirty;
       _dirtyPageCount -= result.length;
       return true;
     }
 
-    if (findPagesInnerFast(_clean, i, pageCount, result)) {
+    if (findPagesInnerFast<true>(_clean, i, pageCount, result)) {
       type = internal::PageType::Clean;
+      clearCleanIndex(result);
       return true;
     }
   }
@@ -286,7 +314,7 @@ bool MeshableArena::findPages(const size_t pageCount, Span &result, internal::Pa
   // Search through all dirty spans first.  We don't worry about
   // fragmenting dirty pages, as being able to reuse dirty pages means
   // we don't increase RSS.
-  if (findPagesInner(_dirty, kSpanClassCount - 1, pageCount, result)) {
+  if (findPagesInner<false>(_dirty, kSpanClassCount - 1, pageCount, result)) {
     type = internal::PageType::Dirty;
     _dirtyPageCount -= result.length;
     return true;
@@ -294,11 +322,11 @@ bool MeshableArena::findPages(const size_t pageCount, Span &result, internal::Pa
 
   // if no dirty pages are available, search clean pages.  An allocated
   // clean page (once it is written to) means an increased RSS.
-  if (findPagesInner(_clean, kSpanClassCount - 1, pageCount, result)) {
+  if (findPagesInner<true>(_clean, kSpanClassCount - 1, pageCount, result)) {
+    clearCleanIndex(result);
     type = internal::PageType::Clean;
     return true;
   }
-
   return false;
 }
 
@@ -358,34 +386,6 @@ static void forEachFree(const internal::vector<Span> freeSpans[kSpanClassCount],
   }
 }
 
-internal::RelaxedBitmap MeshableArena::allocatedBitmap(bool includeDirty) const {
-  internal::RelaxedBitmap bitmap(_end);
-
-  // we can build up a bitmap of in-use pages here by looking at the
-  // arena start and end addresses (to compute the number of
-  // bits/pages), set all bits to 1, then iterate through our _clean
-  // and _dirty lists unsetting pages that aren't in use.
-
-  bitmap.setAll(_end);
-
-  auto unmarkPages = [&](const Span &span) {
-    for (size_t k = 0; k < span.length; k++) {
-#ifndef NDEBUG
-      if (!bitmap.isSet(span.offset + k)) {
-        debug("arena: bit %zu already unset 1 (%zu/%zu)\n", k, span.offset, span.length);
-      }
-#endif
-      bitmap.unset(span.offset + k);
-    }
-  };
-
-  if (includeDirty)
-    forEachFree(_dirty, unmarkPages);
-  forEachFree(_clean, unmarkPages);
-
-  return bitmap;
-}
-
 char *MeshableArena::pageAlloc(Span &result, size_t pageCount, size_t pageAlignment) {
   if (pageCount == 0) {
     return nullptr;
@@ -402,7 +402,7 @@ char *MeshableArena::pageAlloc(Span &result, size_t pageCount, size_t pageAlignm
 
   d_assert(contains(ptrFromOffset(span.offset)));
 #ifndef NDEBUG
-  if (_mhIndex[span.offset].load()) {
+  if (_mhIndex[span.offset].load() > 0) {
     mesh::debug("----\n");
     auto mh = reinterpret_cast<MiniHeap *>(miniheapForArenaOffset(span.offset));
     mh->dumpDebug();
@@ -485,7 +485,27 @@ void MeshableArena::getSpansFromBg(bool wait) {
             }
           }
 #endif
-          _clean[s.spanClass()].emplace_back(s);
+          uint32_t spanClass, index;
+          if (s.offset > 0) {
+            getCleanIndex(s.offset - 1, spanClass, index);
+            if (spanClass < kSpanClassCount) {
+              Span left = popCleanSpan(spanClass, index);
+              s.offset = left.offset;
+              s.length += left.length;
+              clearCleanIndex(left);
+            }
+          }
+
+          if (s.offset + s.length < kArenaSize / kPageSize) {
+            getCleanIndex(s.offset + s.length, spanClass, index);
+            if (spanClass < kSpanClassCount) {
+              Span right = popCleanSpan(spanClass, index);
+              clearCleanIndex(right);
+              s.length += right.length;
+            }
+          }
+          // _clean[s.spanClass()].emplace_back(s);
+          freeCleanSpan(s);
           pageCount += s.length;
         }
 
@@ -514,8 +534,13 @@ void MeshableArena::getSpansFromBg(bool wait) {
   }
 
   if (last_spans_size != _clean[kSpanClassCount - 1].size()) {
-    ska_sort(_clean[kSpanClassCount - 1].begin(), _clean[kSpanClassCount - 1].end(),
-             [](auto &&span) -> decltype(auto) { return -span.length; });
+    auto &spanList = _clean[kSpanClassCount - 1];
+    ska_sort(spanList.begin(), spanList.end(), [](auto &&span) -> decltype(auto) { return -span.length; });
+    size_t size = spanList.size();
+    for (size_t i = 0; i < size; ++i) {
+      setCleanIndex(spanList[i], i);
+    }
+    narrowArena();
   }
   // debug("getSpansFromBg after sort last");
   // for(size_t i = 0; i < kSpanClassCount; ++i) {
@@ -627,15 +652,11 @@ void MeshableArena::scavenge(bool force) {
 
   tryAndSendToFreeLocked(freeCommand);
 
-  internal::FreeCmd *cleanCommand = new internal::FreeCmd(internal::FreeCmd::CLEAN_PAGE);
-  freeCount = flushSpansByOffset(_clean, cleanCommand->spans, _lastFlushBegin, needFreeCount);
-
   _lastFlushBegin += needFreeCount;
   if (_lastFlushBegin >= _end) {
     _lastFlushBegin = 0;
   }
 
-  tryAndSendToFreeLocked(cleanCommand);
   // debug("FreeCmd::CLEAN_PAGE");
 
   tryAndSendToFreeLocked(new internal::FreeCmd(internal::FreeCmd::FLUSH));
@@ -827,6 +848,9 @@ void MeshableArena::prepareForFork() {
 }
 
 void MeshableArena::afterForkParentAndChild() {
+  tryAndSendToFreeLocked(new internal::FreeCmd(internal::FreeCmd::FLUSH_ALL));
+  getSpansFromBg(true);
+
   // remap the large area, from end to the big end
   size_t hasnt_use = kArenaSize - _end * kPageSize;
   void *address = (void *)((size_t)_arenaBegin + _end * kPageSize);
@@ -844,9 +868,6 @@ void MeshableArena::afterForkParentAndChild() {
   if (kAdviseDump) {
     madvise(address, address_size, MADV_DONTDUMP);
   }
-
-  tryAndSendToFreeLocked(new internal::FreeCmd(internal::FreeCmd::FLUSH_ALL));
-  getSpansFromBg(true);
 
   // remap all the clean spans
   size_t count = 0;

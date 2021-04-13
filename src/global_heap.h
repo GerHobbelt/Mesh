@@ -93,14 +93,6 @@ public:
     _readIndex = _writeIndex = 0;
   }
 
-  size_t totalCache() const {
-    size_t sum = 0;
-    for (uint32_t i = _readIndex; i < _writeIndex; ++i) {
-      sum += _cache[i % kMaxCentralCacheLength].size;
-    }
-    return sum;
-  }
-
   inline uint32_t size() const {
     lock_guard<internal::SpinLockType> lock(_lock);
     return _writeIndex - _readIndex;
@@ -114,7 +106,7 @@ public:
     return _readIndex == _writeIndex;
   }
 
-  bool push(void *head, void *tail, uint32_t size) {
+  bool push(void *head) {
     lock_guard<internal::SpinLockType> lock(_lock);
     if (_writeIndex - _readIndex >= kMaxCentralCacheLength) {
       return false;
@@ -123,13 +115,11 @@ public:
     ++_writeIndex;
     MeshEntry &cache = _cache[writeIndex];
     cache.head = head;
-    cache.tail = tail;
     cache.timestamp = time::now_milliseconds();
-    cache.size = size;
     return true;
   }
 
-  bool pop(void *&head, void *&tail, uint32_t &size) {
+  bool pop(void *&head) {
     lock_guard<internal::SpinLockType> lock(_lock);
     if (_readIndex == _writeIndex) {
       return false;
@@ -139,12 +129,10 @@ public:
     const auto popIndex = _writeIndex % kMaxCentralCacheLength;
     MeshEntry &cache = _cache[popIndex];
     head = cache.head;
-    tail = cache.tail;
-    size = cache.size;
     return true;
   }
 
-  bool pop_timeout(void *&head, void *&tail, uint32_t &size, uint64_t timeout) {
+  bool pop_timeout(void *&head, uint64_t timeout) {
     lock_guard<internal::SpinLockType> lock(_lock);
     if (_writeIndex - _readIndex < kMinCentralCacheLength) {
       return false;
@@ -162,17 +150,13 @@ public:
       _writeIndex -= kMaxCentralCacheLength;
     }
     head = cache.head;
-    tail = cache.tail;
-    size = cache.size;
     return true;
   }
 
 private:
   struct MeshEntry {
     void *head;
-    void *tail;
     uint64_t timestamp;
-    uint32_t size;
   };
   MeshEntry _cache[kMaxCentralCacheLength];
   uint32_t _readIndex{0};
@@ -444,8 +428,10 @@ public:
     fillFromList(miniheaps, current, freelist.empty, miniheaps.size() + 1);
   }
 
-  bool allocFromCentralCache(int sizeClass, void *&head, void *&tail, uint32_t &size);
-  void releaseToCentralCache(int sizeClass, void *head, void *tail, uint32_t size, pid_t current);
+  bool allocFromCentralCache(int sizeClass, void *&head);
+  void releaseToCentralCache(int sizeClass, void *head, uint32_t size, pid_t current);
+
+  void freePtrList(void *head, size_t size);
   void flushCentralCache();
   size_t flushCentralCache(size_t sizeClass, size_t limit);
 

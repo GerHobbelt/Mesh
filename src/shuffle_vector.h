@@ -32,50 +32,39 @@ public:
 
   inline void ATTRIBUTE_ALWAYS_INLINE push(void *ptr) {
     *reinterpret_cast<void **>(ptr) = _head;
+    if (unlikely(_length == numToMove())) {
+      _anchor = ptr;
+    }
     _head = ptr;
-    if (_tail == nullptr) {
-      _tail = ptr;
-    }
-    if (unlikely(_length == SizeMap::NumToMoveForClass(_sizeClass))) {
-      _anchor = _head;
-    }
     ++_length;
   }
 
-  inline void ATTRIBUTE_ALWAYS_INLINE push_list(void *head, void *tail, uint32_t length) {
-    *reinterpret_cast<void **>(tail) = _head;
+  inline void ATTRIBUTE_ALWAYS_INLINE push_list(void *head, uint32_t length) {
+    d_assert(_head == nullptr);
+    d_assert(_anchor == nullptr);
+    d_assert(_length == 0);
     _head = head;
-    _length += length;
-    if (!_tail) {
-      _tail = tail;
-    }
-    _anchor = nullptr;
+    _length = length;
   }
 
   inline void *ATTRIBUTE_ALWAYS_INLINE pop() {
     void *val = _head;
-    _head = *reinterpret_cast<void **>(_head);
     --_length;
+    _head = *reinterpret_cast<void **>(val);
     if (unlikely(val == _anchor)) {
       _anchor = nullptr;
-      d_assert(_length == SizeMap::NumToMoveForClass(_sizeClass));
-    }
-    if (_head == nullptr) {
-      _tail = nullptr;
+      d_assert(_length == numToMove());
     }
     return val;
   }
 
-  uint32_t pop_list(uint32_t size, void *&head, void *&tail) {
+  uint32_t pop_list(uint32_t size, void *&head) {
     if (_length > size) {
-      d_assert(size == SizeMap::NumToMoveForClass(_sizeClass));
+      d_assert(size == numToMove());
       d_assert(_anchor != nullptr);
-      d_assert(_length >= size);
 
       head = *reinterpret_cast<void **>(_anchor);
       *reinterpret_cast<void **>(_anchor) = nullptr;
-      tail = _tail;
-      _tail = _anchor;
       _anchor = nullptr;
       _length -= size;
 
@@ -85,9 +74,8 @@ public:
     } else {
       d_assert(_length <= size);
       head = _head;
-      tail = _tail;
       size = _length;
-      _head = _tail = _anchor = nullptr;
+      _head = _anchor = nullptr;
       _length = 0;
       return size;
     }
@@ -118,20 +106,23 @@ public:
     return length;
   }
 
-  inline uint32_t maxCount() const {
-    return SizeMap::MaxCacheForClass(_sizeClass);
+  inline uint32_t numToMove() const {
+    return _maxCount / 2 + 1;
   }
 
-  void setSizeClass(uint32_t sizeClass) {
-    _sizeClass = sizeClass;
+  inline uint32_t maxCount() const {
+    return _maxCount;
+  }
+
+  void setMaxCount(uint32_t maxCount) {
+    _maxCount = maxCount;
   }
 
 private:
   void *_head{nullptr};
-  void *_tail{nullptr};
   void *_anchor{nullptr};
   uint32_t _length{0};
-  uint32_t _sizeClass{0};
+  uint32_t _maxCount{0};
 };
 
 class ShuffleVector {
@@ -232,7 +223,7 @@ public:
     _objectSize = sz;
     _objectCount = SizeMap::ObjectCountForClass(sizeClass);
     _cache = cache;
-    _cache->setSizeClass(sizeClass);
+    _cache->setMaxCount(SizeMap::MaxCacheForClass(sizeClass));
   }
 
 private:
