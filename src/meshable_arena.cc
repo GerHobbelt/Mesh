@@ -255,7 +255,6 @@ bool MeshableArena::findPagesInner(internal::vector<Span> freeSpans[kSpanClassCo
       freeCleanSpan(rest);
     } else {
       freeSpans[ci].emplace_back(rest);
-      moveBiggerTofirst(freeSpans[ci]);
     }
   }
   d_assert(span.length == pageCount);

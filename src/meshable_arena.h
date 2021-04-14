@@ -223,14 +223,6 @@ private:
     }
   }
 
-  void moveBiggerTofirst(internal::vector<Span> &spans) {
-    if (spans.size() > 1) {
-      if (spans[0].length > spans[spans.size() - 1].length) {
-        std::swap(spans[0], spans[spans.size() - 1]);
-      }
-    }
-  }
-
   inline void freeSpan(const Span &span, const internal::PageType flags) {
     if (span.length == 0) {
       return;
@@ -240,7 +232,6 @@ private:
     // and returning excess back to the arena
     if (flags == internal::PageType::Clean) {
       freeCleanSpan(span);
-      // moveBiggerTofirst(_clean[span.spanClass()]);
       d_assert(_cowBitmap.isSet(span.offset));
       return;
     }
@@ -256,7 +247,6 @@ private:
       }
 
       _dirty[span.spanClass()].emplace_back(span);
-      // moveBiggerTofirst(_dirty[span.spanClass()]);
       _dirtyPageCount += span.length;
 
       if (_dirtyPageCount > kMaxDirtyPageThreshold) {
