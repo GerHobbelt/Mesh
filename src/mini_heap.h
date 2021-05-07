@@ -32,12 +32,11 @@ private:
     return 1UL << pos;
   }
   static constexpr uint32_t SizeClassShift = 0;
-  static constexpr uint32_t FreelistIdShift = 6;
+  // static constexpr uint32_t FreelistIdShift = 6;
   static constexpr uint32_t MaxCountShift = 9;
   static constexpr uint32_t EpochShift = 18;
-  static constexpr uint32_t AttachedOffset = 29;
-  static constexpr uint32_t MeshedOffset = 30;
-  static constexpr uint32_t PartialFreeOffset = 31;
+  static constexpr uint32_t ArenaShift = 27;
+  static constexpr uint32_t MeshedOffset = 31;
 
   inline void ATTRIBUTE_ALWAYS_INLINE setMasked(uint32_t mask, uint32_t newVal) {
     uint32_t oldFlags = _flags.load(std::memory_order_relaxed);
@@ -50,36 +49,22 @@ private:
   }
 
 public:
-  explicit Flags(uint32_t maxCount, uint32_t sizeClass, uint32_t freelistId) noexcept
-      : _flags{(maxCount << MaxCountShift) + (sizeClass << SizeClassShift) + (freelistId << FreelistIdShift) +
+  explicit Flags(uint32_t maxCount, uint32_t sizeClass, uint32_t arenaId) noexcept
+      : _flags{(maxCount << MaxCountShift) + (sizeClass << SizeClassShift) + (arenaId << ArenaShift) +
                (((_flags >> EpochShift) & 0x1f) << EpochShift)} {
-    d_assert((freelistId & 0x7) == freelistId);
-    d_assert((sizeClass & ((1 << FreelistIdShift) - 1)) == sizeClass);
     // d_assert(svOffset < 255);
     d_assert_msg(sizeClass < 255, "sizeClass: %u", sizeClass);
     d_assert(maxCount <= 256);
     d_assert(this->maxCount() == maxCount);
   }
 
-  inline uint32_t freelistId() const {
-    return (_flags.load(std::memory_order_seq_cst) >> FreelistIdShift) & 0x7;
-  }
-
-  inline void setFreelistId(uint32_t freelistId) {
-    static_assert(list::Max <= (1 << FreelistIdShift), "expected max < 4");
-    d_assert(freelistId < list::Max);
-    uint32_t mask = ~(static_cast<uint32_t>(0x7) << FreelistIdShift);
-    uint32_t newVal = (static_cast<uint32_t>(freelistId) << FreelistIdShift);
-    setMasked(mask, newVal);
-  }
-
   inline uint32_t maxCount() const {
     // XXX: does this assume little endian?
-    return (_flags.load(std::memory_order_seq_cst) >> MaxCountShift) & 0x1ff;
+    return (_flags.load(std::memory_order_relaxed) >> MaxCountShift) & 0x1ff;
   }
 
   inline uint32_t sizeClass() const {
-    return (_flags.load(std::memory_order_seq_cst) >> SizeClassShift) & 0x3f;
+    return (_flags.load(std::memory_order_relaxed) >> SizeClassShift) & 0x3f;
   }
 
   inline uint32_t createEpoch() const {
@@ -93,6 +78,10 @@ public:
     setMasked(mask, newVal);
   }
 
+  inline uint32_t arenaId() const {
+    return (_flags.load(std::memory_order_seq_cst) >> ArenaShift) & 0x7;
+  }
+
   inline void setMeshed() {
     set(MeshedOffset);
   }
@@ -103,30 +92,6 @@ public:
 
   inline bool ATTRIBUTE_ALWAYS_INLINE isMeshed() const {
     return is(MeshedOffset);
-  }
-
-  inline void setPartialFree() {
-    set(PartialFreeOffset);
-  }
-
-  inline void unsetPartialFree() {
-    unset(PartialFreeOffset);
-  }
-
-  inline bool ATTRIBUTE_ALWAYS_INLINE isPartialFree() const {
-    return is(PartialFreeOffset);
-  }
-
-  inline void setAttached() {
-    set(AttachedOffset);
-  }
-
-  inline void unsetAttached() {
-    unset(AttachedOffset);
-  }
-
-  inline bool ATTRIBUTE_ALWAYS_INLINE isAttached() const {
-    return is(AttachedOffset);
   }
 
 private:
@@ -167,12 +132,12 @@ private:
   DISALLOW_COPY_AND_ASSIGN(MiniHeap);
 
 public:
-  MiniHeap(void *arenaBegin, Span span, size_t objectCount, size_t objectSize)
+  MiniHeap(void *arenaBegin, Span span, size_t objectCount, size_t objectSize, size_t arenaId)
       : _bitmap(objectCount),
         _span(span),
         _age(time::now_ticks()),
-        _flags(objectCount, objectCount > 1 ? SizeMap::SizeClass(objectSize) : kClassSizesMax, list::Attached),
-        _objectSizeReciprocal(1.0 / (float)objectSize) {
+        _flags(objectCount, objectCount > 1 ? SizeMap::SizeClass(objectSize) : kClassSizesMax, (uint32_t)arenaId),
+        _freelistId{list::Attached} {
     // debug("sizeof(MiniHeap): %zu", sizeof(MiniHeap));
 
     d_assert(_bitmap.inUseCount() == 0);
@@ -203,20 +168,6 @@ public:
   void printOccupancy() const {
     mesh::debug("{\"name\": \"%p\", \"object-size\": %d, \"length\": %d, \"mesh-count\": %d, \"bitmap\": \"%s\"}\n",
                 this, objectSize(), maxCount(), meshCount(), _bitmap.to_string(maxCount()).c_str());
-  }
-
-  inline void ATTRIBUTE_ALWAYS_INLINE free(void *arenaBegin, void *ptr) {
-    // the logic in globalFree is
-    // updated to allow the 'race' between lock-free freeing and
-    // meshing
-    // d_assert(!isMeshed());
-    const ssize_t off = getOff(arenaBegin, ptr);
-    if (unlikely(off < 0)) {
-      d_assert(false);
-      return;
-    }
-
-    freeOff(off);
   }
 
   inline bool meshedFree(const uint8_t off) {
@@ -285,14 +236,12 @@ public:
   }
 
   inline bool ATTRIBUTE_ALWAYS_INLINE isLargeAlloc() const {
-    return maxCount() == 1;
+    return sizeClass() == kNumBins;
   }
 
   inline size_t objectSize() const {
     if (likely(!isLargeAlloc())) {
-      // this doesn't handle all the corner cases of roundf(3),
-      // but it does work for all of our small object size classes
-      return static_cast<size_t>(1 / _objectSizeReciprocal + 0.5);
+      return SizeMap::ByteSizeForClass(sizeClass());
     } else {
       return _span.length * kPageSize;
     }
@@ -340,36 +289,24 @@ public:
     _flags.setMeshed();
   }
 
-  inline void setAttached(pid_t current, MiniHeapListEntry *listHead) {
-    // mesh::debug("MiniHeap(%p:%5zu): current <- %u\n", this, objectSize(), current);
-    if (listHead != nullptr) {
-      _freelist.remove(listHead);
-    }
-    this->setFreelistId(list::Attached);
-    d_assert(!_flags.isAttached());
-    _flags.setAttached();
+  inline uint32_t arenaId() const {
+    return _flags.arenaId();
   }
 
   inline uint8_t freelistId() const {
-    return _flags.freelistId();
+    return _freelistId;
   }
 
   inline void setFreelistId(uint8_t id) {
-    _flags.setFreelistId(id);
+    _freelistId = id;
   }
 
   inline uint32_t age() const {
     return _age;
   }
 
-  inline void unsetAttached() {
-    // mesh::debug("MiniHeap(%p:%5zu): current <- UNSET\n", this, objectSize());
-    // _current.store(0, std::memory_order::memory_order_release);
-    _flags.unsetAttached();
-  }
-
-  inline bool isAttached() const {
-    return _flags.isAttached();
+  void resetAge() {
+    _age = time::now_ticks();
   }
 
   inline bool ATTRIBUTE_ALWAYS_INLINE isMeshed() const {
@@ -380,20 +317,8 @@ public:
     return _nextMeshed.hasValue();
   }
 
-  inline void setPartialFree() {
-    _flags.setPartialFree();
-  }
-
-  inline void unsetPartialFree() {
-    _flags.unsetPartialFree();
-  }
-
-  inline bool ATTRIBUTE_ALWAYS_INLINE isPartialFree() const {
-    return _flags.isPartialFree();
-  }
-
   inline bool isMeshingCandidate() const {
-    return !isAttached() && objectSize() < kPageSize;
+    return !isLargeAlloc() && SizeMap::ByteSizeForClass(sizeClass()) < kPageSize;
   }
 
   /// Returns the fraction full (in the range [0, 1]) that this miniheap is.
@@ -532,13 +457,13 @@ public:
   }
 
   // this only works for unmeshed miniheaps
-  inline uint8_t ATTRIBUTE_ALWAYS_INLINE getOff(const void *arenaBegin, void *ptr) const {
+  inline uint8_t ATTRIBUTE_ALWAYS_INLINE getOff(const void *arenaBegin, void *ptr, float objectSizeReciprocal) const {
     const auto ptrval = reinterpret_cast<uintptr_t>(ptr);
 
     uintptr_t span = reinterpret_cast<uintptr_t>(arenaBegin) + _span.offset * kPageSize;
     d_assert(span != 0);
 
-    const size_t off = (ptrval - span) * _objectSizeReciprocal;
+    const size_t off = (ptrval - span) * objectSizeReciprocal;
     d_assert(off < maxCount());
 
     return off;
@@ -548,13 +473,14 @@ protected:
   internal::Bitmap _bitmap;       // 32 bytes 32
   const Span _span;               // 8        40
   MiniHeapListEntry _freelist{};  // 8        48
-  // atomic<pid_t> _current{0};       // 4        52
-  uint32_t _age{0};                   // 4        52
-  Flags _flags;                       // 4        56
-  const float _objectSizeReciprocal;  // 4        60
-  MiniHeapID _nextMeshed{};           // 4        64
+  uint32_t _age{0};               // 4        52
+  Flags _flags;                   // 4        56
+  uint8_t _freelistId{0};
+  uint8_t _unused[3];
+  MiniHeapID _nextMeshed{};  // 4        64
 };
 
+typedef FixedArray<MiniHeap, 4> MiniHeapArray;
 typedef FixedArray<MiniHeap, 63> MiniHeapArray2;
 
 static_assert(sizeof(pid_t) == 4, "pid_t not 32-bits!");

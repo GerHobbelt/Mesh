@@ -72,6 +72,8 @@ static constexpr int kMapShared = 1;
 static constexpr int kMapShared = kMeshingEnabled ? MAP_SHARED : MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
 #endif
 
+static constexpr uint32_t kMaxArena = 8;
+
 static constexpr size_t kPtrOffset = 48;
 static constexpr size_t kPtrMask = (static_cast<size_t>(-1)) >> (64 - kPtrOffset);
 
@@ -105,7 +107,7 @@ static constexpr size_t kMaxMeshesPerIteration = 2500;
 // maximum number of dirty pages to hold onto before we flush them
 // back to the OS (via MeshableArena::scavenge()
 static constexpr size_t kMaxDirtyPageThreshold = 1 << 15;  // 128 MB in pages
-static constexpr size_t kMinDirtyPageThreshold = 1 << 13;  // 32  MB in pages
+static constexpr size_t kMinDirtyPageThreshold = 1 << 11;  // 8  MB in pages
 
 static constexpr uint32_t kSpanClassCount = 256;
 
@@ -125,9 +127,14 @@ static constexpr bool kEnableShuffleOnInit = SHUFFLE_ON_INIT == 1;
 static constexpr bool kEnableShuffleOnFree = SHUFFLE_ON_FREE == 1;
 static constexpr bool kEnableRecordMiniheapAlive = false;
 
-static constexpr uint64_t kFlushCentralCacheDelay = 60 * 1000;
+static constexpr uint64_t kFlushCentralCacheDelay = 40 * 1000;
 static constexpr size_t kMinCentralCacheLength = 8;
-static constexpr size_t kMaxCentralCacheLength = 1024;
+static constexpr size_t kMaxCentralCacheLength = 256;
+
+static constexpr uint64_t kMask5 = (1ul << 6) - 1;
+static constexpr uint64_t kMask32 = 0xFFFFFFFFul;
+static constexpr uint64_t kMask40 = 0xFFFFFFFFFFul;
+static constexpr uint64_t kMask48 = 0xFFFFFFFFFFFFul;
 
 // madvise(DONTDUMP) the heap to make reasonable coredumps
 static constexpr bool kAdviseDump = true;
@@ -153,7 +160,8 @@ static constexpr size_t kForkCopyFileSize = 32 * 1024 * 1024ul;
 
 // BinnedTracker
 static constexpr size_t kBinnedTrackerBinCount = 1;
-static constexpr size_t kBinnedTrackerMaxEmpty = 64;
+static constexpr size_t kBinnedTrackerMinEmpty = 8;
+static constexpr size_t kBinnedTrackerMaxEmpty = 32;
 
 static inline constexpr size_t PageCount(size_t sz) {
   return (sz + (kPageSize - 1)) / kPageSize;
@@ -390,9 +398,10 @@ private:
   static const uint32_t class_to_size_[kClassSizesMax];
   static const uint32_t class_to_page_[kClassSizesMax];
 
+  static float class_to_size_reciprocal_[kClassSizesMax];
+
   static uint32_t class_max_cache_[kClassSizesMax];
   static uint32_t class_num_to_move_[kClassSizesMax];
-  static uint32_t class_occupancy_cutoff_[kClassSizesMax];  // objectCount * kOccupancyCutoff
 
 public:
   static constexpr size_t num_size_classes = 25;
@@ -409,6 +418,10 @@ public:
 
   static inline uint32_t SizeClassToPageCount(size_t sizeClass) {
     return class_to_page_[sizeClass];
+  }
+
+  static inline float ObjectSizeReciprocalForClass(size_t sizeClass) {
+    return class_to_size_reciprocal_[sizeClass];
   }
 
   // Check if size is small enough to be representable by a size
@@ -432,12 +445,6 @@ public:
   static inline uint32_t ObjectCountForClass(uint32_t cl) {
     return SizeClassToPageCount(cl) * kPageSize / ByteSizeForClass(cl);
   }
-
-  static inline uint32_t OccupancyCutoffForClass(uint32_t cl) {
-    return class_occupancy_cutoff_[cl];
-  }
-
-  static void SetOccupancyCutoff(uint32_t cl, size_t partialSize);
 
   static inline uint32_t NumToMoveForClass(uint32_t cl) {
     return class_num_to_move_[cl];

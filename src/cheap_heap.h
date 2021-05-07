@@ -40,7 +40,6 @@ public:
   }
 
   inline void *alloc() {
-    lock_guard<HL::SpinLockType> lock(_lock);
     if (likely(_freelist != nullptr)) {
       auto ptr = _freelist;
       _freelist = *reinterpret_cast<void **>(ptr);
@@ -68,7 +67,6 @@ public:
   }
 
   inline void free(void *ptr) {
-    lock_guard<HL::SpinLockType> lock(_lock);
     d_assert(ptr >= _arena);
     d_assert(ptr < arenaEnd());
 
@@ -101,7 +99,6 @@ protected:
   char *_arenaDodump{nullptr};
   void *_freelist{nullptr};
   size_t _arenaOff{1};  // can't set to zero, we need MiniHeapId > 0
-  mutable HL::SpinLockType _lock{};
 };
 
 class DynCheapHeap : public OneWayMmapHeap {

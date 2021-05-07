@@ -35,14 +35,15 @@ const uint32_t SizeMap::class_to_size_[kClassSizesMax] = {
 const uint32_t SizeMap::class_to_page_[kClassSizesMax] = {1, 1, 1, 1, 1, 1, 3, 2, 1, 2, 1, 1, 1, 5, 3, 1, 1, 3, 3,
                                                           2, 1, 5, 3, 4, 2, 5, 3, 7, 2, 5, 3, 7, 4, 5, 6, 7, 8};
 
+float SizeMap::class_to_size_reciprocal_[kClassSizesMax] = {};
 uint32_t SizeMap::class_max_cache_[kClassSizesMax] = {};
 uint32_t SizeMap::class_num_to_move_[kClassSizesMax] = {};
-uint32_t SizeMap::class_occupancy_cutoff_[kClassSizesMax] = {};
 
 uint64_t SizeMap::progress_start_time = 0;
 
 void SizeMap::Init() {
   for (size_t sizeClass = 0; sizeClass < kClassSizesMax; ++sizeClass) {
+    uint32_t objectSize = ByteSizeForClass(sizeClass);
     uint32_t objectCount = ObjectCountForClass(sizeClass);
     uint32_t maxCount = objectCount * 6;
     d_assert(maxCount > 0);
@@ -50,24 +51,9 @@ void SizeMap::Init() {
 
     // make sure > 1/2
     class_num_to_move_[sizeClass] = maxCount / 2 + 1;
-
-    if (ByteSizeForClass(sizeClass) < kPageSize) {
-      class_occupancy_cutoff_[sizeClass] = static_cast<uint32_t>(objectCount * kOccupancyCutoff);
-    } else {
-      class_occupancy_cutoff_[sizeClass] = static_cast<uint32_t>(objectCount + 1);
-    }
+    class_to_size_reciprocal_[sizeClass] = 1.0 / (float)objectSize;
   }
   progress_start_time = time::now_milliseconds();
-}
-
-void SizeMap::SetOccupancyCutoff(uint32_t cl, size_t partialSize) {
-  partialSize /= 1024;
-  float cutoff = 0.8 - 0.03 * partialSize;
-  if (cutoff < 0.3) {
-    cutoff = 0.3;
-  }
-  uint32_t objectCount = ObjectCountForClass(cl);
-  class_occupancy_cutoff_[cl] = objectCount * cutoff;
 }
 
 // const internal::BinToken::Size internal::BinToken::Max = numeric_limits<uint32_t>::max();

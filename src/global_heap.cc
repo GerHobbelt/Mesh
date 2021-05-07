@@ -39,13 +39,22 @@ void *GlobalHeap::malloc(size_t sz) {
   return pageAlignedAlloc(1, pageCount);
 }
 
+void GlobalHeap::free(void *ptr, uint32_t arenaId, MiniHeap *mh) {
+  if (mh->isLargeAlloc()) {
+    freeLargeMiniheap(mh);
+    return;
+  }
+  d_assert(arenaId == mh->arenaId());
+  d_assert(arenaId < kMaxArena);
+  _arena[arenaId].freeFor(mh, ptr, arenaBegin());
+}
+
 void GlobalHeap::free(void *ptr) {
   if (unlikely(ptr == nullptr)) {
     return;
   }
 
-  size_t startEpoch{0};
-  auto mh = miniheapForWithEpoch(ptr, startEpoch);
+  auto mh = miniheapFor(ptr);
   if (unlikely(!mh)) {
 #ifndef NDEBUG
     if (ptr != nullptr) {
@@ -54,123 +63,13 @@ void GlobalHeap::free(void *ptr) {
 #endif
     return;
   }
-  this->freeFor(mh, ptr, startEpoch);
-}
-
-void GlobalHeap::freeFor(MiniHeap *mh, void *ptr, size_t startEpoch) {
-  // large objects are tracked with a miniheap per object and don't
-  // trigger meshing, because they are multiples of the page size.
-  // This can also include, for example, single page allocations w/
-  // 16KB alignment.
   if (mh->isLargeAlloc()) {
-    freeMiniheap(mh, false);
+    freeLargeMiniheap(mh);
     return;
   }
-
-  d_assert(mh->maxCount() > 1);
-
-  const auto off = mh->getOff(arenaBegin(), ptr);
-  auto sizeClass = mh->sizeClass();
-
-  if (mh->isMeshed()) {
-    auto leader = mh->meshedLeader();
-    d_assert(leader != nullptr);
-    if (mh->meshedFree(off)) {
-      leader->setPartialFree();
-    }
-    mh = leader;
-  }
-
-  auto freelistId = mh->freelistId();
-  auto isAttached = mh->isAttached();
-  // read inUseCount before calling free to avoid stalling after the
-  // LOCK CMPXCHG in mh->free
-  auto remaining = mh->inUseCount() - 1;
-  auto createEpoch = mh->createEpoch();
-
-  // here can't call mh->free(arenaBegin(), ptr), because in consume takeBitmap always clear the bitmap,
-  // if clearIfNotFree after takeBitmap
-  // it alwasy return false, but in this case, you need to free again.
-  auto wasSet = mh->clearIfNotFree(off);
-
-  // bool shouldMesh = false;
-
-  // the epoch will be odd if a mesh was in progress when we looked up
-  // the miniheap; if that is true, or a meshing started between then
-  // and now we can't be sure the above free was successful
-  if (startEpoch % 2 == 1 || !_meshEpoch.isSame(startEpoch)) {
-    // a mesh was started in between when we looked up our miniheap
-    // and now.  synchronize to avoid races
-    lock_guard<mutex> lock(_freelist[sizeClass].lock);
-
-    if (mh->createEpoch() != createEpoch) {
-      return;
-    }
-    auto origMh = mh;
-    mh = mh->meshedLeader();
-
-    if (mh == nullptr) {
-      mh = origMh;
-    } else {
-      if (unlikely(mh != origMh)) {
-        hard_assert(!mh->isMeshed());
-        if (origMh->meshedFree(off)) {
-          unboundMeshSlowly(mh);
-        }
-        if (!wasSet) {
-          // we have confirmation that we raced with meshing, so free the pointer
-          // on the new miniheap
-          d_assert(sizeClass == mh->sizeClass());
-          mh->freeOff(off);
-        } else {
-          // our MiniHeap is unrelated to whatever is here in memory now - get out of here.
-          return;
-        }
-      }
-    }
-
-    remaining = mh->inUseCount();
-    freelistId = mh->freelistId();
-    isAttached = mh->isAttached();
-
-    if (!isAttached && (remaining == 0 || freelistId == list::Full ||
-                        (freelistId == list::PartialFull && remaining < SizeMap::OccupancyCutoffForClass(sizeClass)))) {
-      // this may free the miniheap -- we can't safely access it after
-      // this point.
-      const bool shouldFlush = postFreeLocked(mh, sizeClass, remaining);
-      mh = nullptr;
-      if (unlikely(shouldFlush)) {
-        flushBinLocked(sizeClass);
-      }
-    }
-  } else {
-    // the free went through ok; if we _were_ full, or now _are_ empty,
-    // make sure to update the littleheaps
-    if (!isAttached && (remaining == 0 || freelistId == list::Full ||
-                        (freelistId == list::PartialFull && remaining < SizeMap::OccupancyCutoffForClass(sizeClass)))) {
-      lock_guard<mutex> lock(_freelist[sizeClass].lock);
-
-      if (mh->createEpoch() != createEpoch) {
-        return;
-      }
-      if (mh->isMeshed()) {
-        d_assert(wasSet);
-        return;
-      }
-      if (mh->isPartialFree()) {
-        d_assert(mh->hasMeshed());
-        unboundMeshSlowly(mh);
-      }
-
-      // a lot could have happened between when we read this without
-      // the lock held and now; just recalculate it.
-      remaining = mh->inUseCount();
-      const bool shouldFlush = postFreeLocked(mh, sizeClass, remaining);
-      if (unlikely(shouldFlush)) {
-        flushBinLocked(sizeClass);
-      }
-    }
-  }
+  auto arenaId = mh->arenaId();
+  d_assert(arenaId < kMaxArena);
+  _arena[arenaId].freeFor(mh, ptr, arenaBegin());
 }
 
 int GlobalHeap::mallctl(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
@@ -190,12 +89,12 @@ int GlobalHeap::mallctl(const char *name, void *oldp, size_t *oldlenp, void *new
     // resetNextMeshCheck();
   } else if (strcmp(name, "mesh.scavenge") == 0) {
     lock.unlock();
-    scavenge(true);
+    scavenge();
     lock.lock();
   } else if (strcmp(name, "mesh.compact") == 0) {
-    meshAllSizeClassesLocked();
+    meshAllSizeClassesLocked(0);
     lock.unlock();
-    scavenge(true);
+    scavenge();
     lock.lock();
   } else if (strcmp(name, "arena") == 0) {
     // not sure what this should do
@@ -270,7 +169,9 @@ void GlobalHeap::meshLocked(MiniHeap *dst, MiniHeap *&src, internal::vector<Span
   });
   // Super::freePhys(reinterpret_cast<void *>(src->getSpanStart(arenaBegin())), dstSpanSize);
   fCmdSpans.emplace_back(src->span());
+
   Super::trackMeshedMiniHeap(src->span(), src);
+
   Super::incMeshedSpanCount(dst->span().length);
   // make sure we adjust what bin the destination is in -- it might
   // now be full and not a candidate for meshing
@@ -278,10 +179,9 @@ void GlobalHeap::meshLocked(MiniHeap *dst, MiniHeap *&src, internal::vector<Span
 }
 
 size_t GlobalHeap::unboundMeshSlowly(MiniHeap *mh) {
-  d_assert(mh->hasMeshed());
-  const auto spanSize = mh->spanSize();
-
-  mh->unsetPartialFree();
+  if (!mh->hasMeshed()) {
+    return 0;
+  }
   MiniHeap *toFree[kMaxMeshes];
   size_t last = 0;
 
@@ -303,13 +203,24 @@ size_t GlobalHeap::unboundMeshSlowly(MiniHeap *mh) {
     MiniHeap *mh = toFree[i];
     d_assert(mh->isMeshed());
     mh->setMeshedLeader(MiniHeapID{});
-    Super::free(reinterpret_cast<void *>(mh->getSpanStart(arenaBegin())), spanSize, internal::PageType::Meshed);
-    freeMiniheapAfterMeshLocked(mh, false);
+    Super::freeMiniheap(mh, internal::PageType::Meshed);
   }
   return last;
 }
 
-size_t GlobalHeap::meshSizeClassLocked(size_t sizeClass, MergeSetArray &mergeSets, SplitArray &all) {
+Arena *GlobalHeap::allocArena() {
+  uint32_t index = 0;
+  uint32_t refcount = -1u;
+  for (uint32_t i = 0; i < kMaxArena; ++i) {
+    if (_arena[i].refcount() < refcount) {
+      index = i;
+      refcount = _arena[i].refcount();
+    }
+  }
+  return &_arena[index];
+}
+
+size_t GlobalHeap::meshSizeClassLocked(uint32_t arenaId, size_t sizeClass, MergeSetArray &mergeSets, SplitArray &all) {
   // debug("mesh class = %d", sizeClass);
   size_t mergeSetCount = 0;
   // memset(reinterpret_cast<void *>(&mergeSets), 0, sizeof(mergeSets));
@@ -322,10 +233,12 @@ size_t GlobalHeap::meshSizeClassLocked(size_t sizeClass, MergeSetArray &mergeSet
   // }
   //
 
-  flushCentralCache(sizeClass, 5000u);
+  auto &arena = _arena[arenaId];
 
-  auto &freelist = _freelist[sizeClass];
-  lock_guard<mutex> lock(_freelist[sizeClass].lock);
+  arena.flushCentralCache(sizeClass, 5000ul);
+
+  auto &freelist = arena.freelist(sizeClass);
+  lock_guard<mutex> lock(freelist.lock());
 
   auto meshFound =
       function<bool(std::pair<MiniHeap *, MiniHeap *> &&)>([&](std::pair<MiniHeap *, MiniHeap *> &&miniheaps) {
@@ -336,14 +249,14 @@ size_t GlobalHeap::meshSizeClassLocked(size_t sizeClass, MergeSetArray &mergeSet
         return mergeSetCount < kMaxMergeSets;
       });
 
-  method::shiftedSplitting(_fastPrng, &freelist.partial.head, all, meshFound);
+  method::shiftedSplitting(_fastPrng, &freelist.partialList().head, all, meshFound);
 
   if (mergeSetCount == 0) {
     // debug("nothing to mesh. sizeClass = %d", sizeClass);
     return 0;
   }
 
-  lock_guard<EpochLock> epochLock(_meshEpoch);
+  lock_guard<EpochLock> epochLock(freelist.meshEpoch());
   size_t meshCount = 0;
 
   internal::FreeCmd *fCommand = new internal::FreeCmd(internal::FreeCmd::FREE_PAGE);
@@ -362,27 +275,18 @@ size_t GlobalHeap::meshSizeClassLocked(size_t sizeClass, MergeSetArray &mergeSet
     auto oneEmpty = false;
     auto dstUseCount = dst->inUseCount();
     if (dstUseCount == 0) {
-      postFreeLocked(dst, sizeClass, 0);
+      arena.postFreeLocked(dst, sizeClass, 0);
       oneEmpty = true;
     }
     auto srcUseCount = src->inUseCount();
     if (srcUseCount == 0) {
-      postFreeLocked(src, sizeClass, 0);
+      arena.postFreeLocked(src, sizeClass, 0);
       oneEmpty = true;
     }
     // merge _into_ the one with a larger mesh count, potentially
     // swapping the order of the pair
     auto dstCount = dst->meshCount();
-    if (dstCount > 1 && dst->isPartialFree()) {
-      dstCount -= unboundMeshSlowly(dst);
-      d_assert(dst->meshCount() == dstCount);
-    }
-
     auto srcCount = src->meshCount();
-    if (srcCount > 1 && src->isPartialFree()) {
-      srcCount -= unboundMeshSlowly(src);
-      d_assert(src->meshCount() == srcCount);
-    }
 
     if (dstCount + srcCount > kMaxMeshes) {
       continue;
@@ -403,13 +307,12 @@ size_t GlobalHeap::meshSizeClassLocked(size_t sizeClass, MergeSetArray &mergeSet
   tryAndSendToFree(fCommand);
   // flush things once more (since we may have called postFree instead
   // of mesh above)
-  flushBinLocked(sizeClass);
-
-  SizeMap::SetOccupancyCutoff(sizeClass, freelist.partial.size);
+  arena.flushBinLocked(sizeClass);
+  freelist.calcOccupancyCutoff(sizeClass);
   return meshCount;
 }
 
-void GlobalHeap::meshAllSizeClassesLocked() {
+void GlobalHeap::meshAllSizeClassesLocked(uint32_t arenaId) {
   static MergeSetArray PAGE_ALIGNED MergeSets;
   static_assert(sizeof(MergeSets) == sizeof(void *) * 2 * 4096, "array too big");
   d_assert((reinterpret_cast<uintptr_t>(&MergeSets) & (kPageSize - 1)) == 0);
@@ -423,42 +326,44 @@ void GlobalHeap::meshAllSizeClassesLocked() {
   // them to the identity mapping, ensuring we don't blow past our VMA
   // limit (which is why we set the force flag to true)
   if (Super::aboveMeshThreshold()) {
-    Super::scavenge(true);
+    Super::scavenge();
     return;
   }
 
-  // if (!_lastMeshEffective.load(std::memory_order::memory_order_acquire)) {
-  //   return;
-  // }
+  auto &arena = _arena[arenaId];
+
+  size_t lastMeshClass = arena.lastMeshClass();
 
   // const auto start = time::now();
 
   // first, clear out any free memory we might have
-  ++_lastMeshClass;
+  ++lastMeshClass;
 
-  if (SizeMap::ByteSizeForClass(_lastMeshClass) >= kPageSize) {
-    _lastMeshClass = 0;
+  if (SizeMap::ByteSizeForClass(lastMeshClass) >= kPageSize) {
+    lastMeshClass = 0;
   }
 
-  d_assert(_lastMeshClass < kNumBins);
+  d_assert(lastMeshClass < kNumBins);
 
-  // flushBin(_lastMeshClass);
+  // flushBin(lastMeshClass);
   size_t totalMeshCount = 0;
 
-  while (SizeMap::ByteSizeForClass(_lastMeshClass) < kPageSize) {
-    auto meshCount = meshSizeClassLocked(_lastMeshClass, MergeSets, All);
+  while (SizeMap::ByteSizeForClass(lastMeshClass) < kPageSize) {
+    size_t meshCount = 0;
+    meshCount += meshSizeClassLocked(arenaId, lastMeshClass, MergeSets, All);
     if (meshCount > 0) {
       totalMeshCount += meshCount;
       break;
     } else {
-      ++_lastMeshClass;
+      ++lastMeshClass;
     }
   }
 
-  _lastMeshEffective = totalMeshCount > 256;
+  arena.setLastMeshClass(lastMeshClass);
+
   _stats.meshCount += totalMeshCount;
 
-  Super::scavenge(true);
+  Super::scavenge();
 
   _lastMesh = time::now();
 
@@ -482,10 +387,6 @@ void GlobalHeap::dumpStats(int level, bool beDetailed) const {
   debug("Meshed pages:       %zu\n", meshedPage);
   debug("Meshed pages HWM:   %zu\n", meshedPageHWM);
   debug("Meshed MB HWM:      %.1f\n", meshedPageHWM * 4096.0 / 1024.0 / 1024.0);
-  // debug("Peak RSS reduction: %.2f\n", rssSavings);
-  debug("MH Alloc Count:     %zu\n", (size_t)_stats.mhAllocCount);
-  debug("MH Free  Count:     %zu\n", (size_t)_stats.mhFreeCount);
-  debug("MH High Water Mark: %zu\n", (size_t)_stats.mhHighWaterMark);
   if (level > 1) {
     // for (size_t i = 0; i < kNumBins; i++) {
     //   _littleheaps[i].dumpStats(beDetailed);
@@ -493,166 +394,14 @@ void GlobalHeap::dumpStats(int level, bool beDetailed) const {
   }
 }
 
-void GlobalHeap::dumpMiniHeaps(const char *prefix, size_t sizeClass, const MiniHeapListEntry *miniheaps, int level) {
-  size_t total = 0;
-  size_t hasMeshed = 0;
-  size_t totalMesh = 0;
-  size_t maxMeshes = 0;
-  size_t release = 0;
-  constexpr size_t kCap = 11;
-  size_t fullness[kCap] = {0};
-
-  MiniHeapID mhId = miniheaps->next();
-  while (mhId != list::Head) {
-    auto mh = GetMiniHeap(mhId);
-    mhId = mh->getFreelist()->next();
-    ++total;
-
-    ++fullness[mh->inUseCount() * 10 / mh->maxCount()];
-    auto meshCount = mh->meshCount();
-    if (meshCount > 1) {
-      ++hasMeshed;
-      totalMesh += meshCount;
-      if (meshCount > maxMeshes) {
-        maxMeshes = meshCount;
-      }
-      release += unboundMeshSlowly(mh);
-    }
-  }
-  debug(
-      "%s class:%-2zu, MHTotalCount:%zu, MHHasMeshedCount:%zu(%.2lf%%), MHTotalMeshedCount:%zu, "
-      "MaxMeshes:%zu, AvgMeshes:%.2lf, release:%zu",
-      prefix, sizeClass, total, hasMeshed, hasMeshed * 100.0 / std::max(total, 1ul), totalMesh, maxMeshes,
-      double(totalMesh) / std::max(hasMeshed, 1ul), release);
-  for (size_t i = 0; i < kCap; ++i) {
-    debug("%s class:%-2zu, fullness %3zu - %3zu: %6zu (%.1f%%)", prefix, sizeClass, i * 10,
-          (i < kCap - 1 ? i * 10 + 9 : i * 10), fullness[i], fullness[i] * 100.0 / total);
-  }
-}
-
 void GlobalHeap::dumpList(int level) {
   lock_guard<mutex> lock(_miniheapLock);
-  for (size_t sizeClass = 0; sizeClass < kNumBins; ++sizeClass) {
-    const auto pages = SizeMap::SizeClassToPageCount(sizeClass);
-    {
-      lock_guard<mutex> lock(_freelist[sizeClass].lock);
-      const auto &freelist = _freelist[sizeClass].partial;
-      if (freelist.size) {
-        if (level > 0) {
-          dumpMiniHeaps("MeshPartialList ----", sizeClass, &freelist.head, level);
-        }
-        debug("MeshPartialList ++++++ class:%-2zu, length:%-6zu(%.2f(MB))", sizeClass, freelist.size,
-              freelist.size * pages * 4.0 / 1024.0);
-      }
-    }
-    {
-      lock_guard<mutex> lock(_freelist[sizeClass].lock);
-      const auto &freelist = _freelist[sizeClass].partialFull;
-      if (freelist.size) {
-        if (level > 0) {
-          dumpMiniHeaps("MeshParFullList ----", sizeClass, &freelist.head, level);
-        }
-        debug("MeshParfullList ++++++ class:%-2zu, length:%-6zu(%.2f(MB))", sizeClass, freelist.size,
-              freelist.size * pages * 4.0 / 1024.0);
-      }
-    }
-    {
-      lock_guard<mutex> lock(_freelist[sizeClass].lock);
-      const auto &freelist = _freelist[sizeClass].full;
-      if (freelist.size) {
-        if (level > 0) {
-          dumpMiniHeaps("MeshFullList -------", sizeClass, &freelist.head, level);
-        }
-        debug("MeshFullList +++++++++ class:%-2zu, length:%-6zu(%.2f(MB))", sizeClass, freelist.size,
-              freelist.size * pages * 4.0 / 1024.0);
-      }
-    }
-    {
-      lock_guard<mutex> lock(_freelist[sizeClass].lock);
-      const auto &freelist = _freelist[sizeClass].empty;
-      if (freelist.size) {
-        debug("MeshEmptyList ++++++++ class:%-2zu, length:%-6zu(%.2f(MB))", sizeClass, freelist.size,
-              freelist.size * pages * 4.0 / 1024.0);
-      }
-    }
-  }
-  if (level > 0) {
-    for (size_t i = 0; i < kNumBins; ++i) {
-      debug("MeshCentralCache --+++++ class:%-2zu, length: %-3zu (%.2f(MB))", i, _cache[i].size(),
-            _cache[i].size() * SizeMap::NumToMoveForClass(i) * SizeMap::ByteSizeForClass(i) / 1024.0 / 1024.0);
-    }
-  }
-  if (kEnableRecordMiniheapAlive && level > 0) {
-    for (size_t i = 0; i < kNumBins + 1; ++i) {
-      auto &alive = _stats.alives[i];
-      lock_guard<internal::SpinLockType> lockg(alive.lock);
-      debug("MeshAlive ---------+++++ class:%-2zu, totalFreeCount: %6zu, Alive(avg/max): %.2f/%.2f (seconds)", i,
-            alive.freeCount, (alive.totalAlive / 100.0 / std::max(1ul, alive.freeCount)), alive.maxAlive / 100.0);
-    }
+  for (uint32_t arenaId = 0; arenaId < kMaxArena; ++arenaId) {
+    _arena[arenaId].dumpFreeList(level);
   }
   if (level > 0) {
     dumpSpans();
   }
-}
-
-bool GlobalHeap::allocFromCentralCache(int sizeClass, void *&head) {
-  CentralCache &cache = _cache[sizeClass];
-  return cache.pop(head);
-}
-
-void GlobalHeap::releaseToCentralCache(int sizeClass, void *head, uint32_t size, pid_t current) {
-  if (!size) {
-    return;
-  }
-  if (size == SizeMap::NumToMoveForClass(sizeClass)) {
-    CentralCache &cache = _cache[sizeClass];
-    if (cache.push(head)) {
-      return;
-    }
-  }
-  if (size > 0) {
-    freePtrList(head, size);
-    maybeMesh();
-  }
-}
-
-void GlobalHeap::flushCentralCache() {
-  size_t totalSize = 0;
-  bool shouldMesh = false;
-  for (int i = 0; i < 5 && totalSize < 1000; ++i) {
-    const auto old = _lastFreeClass.fetch_add(1);
-    size_t sizeClass = old % kNumBins;
-    totalSize += flushCentralCache(sizeClass, 1000u);
-    if (old % 8 == 0) {
-      shouldMesh = true;
-    }
-  }
-  if (shouldMesh || totalSize) {
-    maybeMesh();
-  }
-}
-
-size_t GlobalHeap::flushCentralCache(size_t sizeClass, size_t limit) {
-  void *head = nullptr;
-  size_t totalSize = 0;
-  CentralCache &cache = _cache[sizeClass];
-  while (totalSize < limit && cache.pop_timeout(head, _flushCentralCacheDelay)) {
-    size_t size = SizeMap::NumToMoveForClass(sizeClass);
-    freePtrList(head, size);
-    totalSize += size;
-  }
-  return totalSize;
-}
-
-void GlobalHeap::freePtrList(void *head, size_t size) {
-  void *tmp{nullptr};
-  while (head) {
-    tmp = *reinterpret_cast<void **>(head);
-    free(head);
-    head = tmp;
-    --size;
-  }
-  d_assert(size == 0);
 }
 
 namespace method {

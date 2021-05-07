@@ -68,6 +68,10 @@ public:
     return _size;
   }
 
+  uint32_t capacity() const {
+    return Capacity;
+  }
+
   bool full() const {
     return _size == Capacity;
   }

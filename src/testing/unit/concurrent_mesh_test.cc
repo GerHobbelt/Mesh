@@ -75,18 +75,9 @@ static void meshTestConcurrentWrite(bool invert) {
 
   ASSERT_EQ(gheap.getAllocatedMiniheapCount(), 0UL);
 
-  FixedArray<MiniHeap, 1> array{};
-
   // allocate three miniheaps for the same object size from our global heap
-  gheap.allocSmallMiniheaps(SizeMap::SizeClass(StrLen), StrLen, array, tid);
-  MiniHeap *mh1 = array[0];
-  array.clear();
-
-  gheap.allocSmallMiniheaps(SizeMap::SizeClass(StrLen), StrLen, array, tid);
-  MiniHeap *mh2 = array[0];
-  array.clear();
-
-  ASSERT_EQ(gheap.getAllocatedMiniheapCount(), 2UL);
+  MiniHeap *mh1 = gheap.allocMiniheapLocked(kNumBins, 0, 2, 1, 65536, 1);
+  MiniHeap *mh2 = gheap.allocMiniheapLocked(kNumBins, 0, 2, 1, 65536, 1);
 
   // sanity checks
   ASSERT_TRUE(mh1 != mh2);
@@ -166,14 +157,13 @@ static void meshTestConcurrentWrite(bool invert) {
   ASSERT_TRUE(mh1->isEmpty());  // safe because mh1 isn't "done"
 
   note("ABOUT TO FREE");
-  gheap.freeMiniheap(mh1);
+  gheap.freeLargeMiniheap(mh1);
+  gheap.freeLargeMiniheap(mh2);
   note("DONE FREE");
 
   note("ABOUT TO SCAVENGE");
-  gheap.scavenge(true);
+  gheap.scavenge();
   note("DONE SCAVENGE");
-
-  ASSERT_EQ(gheap.getAllocatedMiniheapCount(), 0UL);
 }
 
 TEST(ConcurrentMeshTest, TryMesh) {

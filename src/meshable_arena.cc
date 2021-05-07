@@ -53,12 +53,10 @@ MeshableArena::MeshableArena() : SuperHeap(), _fastPrng(internal::seed(), intern
   _arenaBegin = SuperHeap::map(kArenaSize, kMapShared, fd);
   _arenaEnd = reinterpret_cast<void *>((char *)(_arenaBegin) + kArenaSize);
 
-  _mhIndex = reinterpret_cast<atomic<int32_t> *>(SuperHeap::malloc(indexSize() * sizeof(uint32_t)));
-  _clIndex = reinterpret_cast<atomic<uint8_t> *>(SuperHeap::malloc(indexSize()));
+  _mhIndex = reinterpret_cast<atomic<uint64_t> *>(SuperHeap::malloc(indexSize() * sizeof(uint64_t)));
 
   hard_assert(_arenaBegin != nullptr);
   hard_assert(_mhIndex != nullptr);
-  hard_assert(_clIndex != nullptr);
 
   if (kAdviseDump) {
     madvise(_arenaBegin, kArenaSize, MADV_DONTDUMP);
@@ -350,7 +348,7 @@ Span MeshableArena::reservePages(const size_t pageCount, const size_t pageAlignm
   d_assert(flags != internal::PageType::Unknown);
 
   if (unlikely(pageAlignment > 1 && ((ptrvalFromOffset(result.offset) / kPageSize) % pageAlignment != 0))) {
-    freeSpan(result, flags);
+    freeSpanLocked(result, flags);
     // recurse once, asking for enough extra space that we are sure to
     // be able to find an aligned offset of pageCount pages within.
     result = reservePages(pageCount + 2 * pageAlignment, 1);
@@ -363,9 +361,9 @@ Span MeshableArena::reservePages(const size_t pageCount, const size_t pageAlignm
     const auto unwantedPageCount = alignedOff - result.offset;
     auto alignedResult = result.splitAfter(unwantedPageCount);
     d_assert(alignedResult.offset == alignedOff);
-    freeSpan(result, flags);
+    freeSpanLocked(result, flags);
     const auto excess = alignedResult.splitAfter(pageCount);
-    freeSpan(excess, flags);
+    freeSpanLocked(excess, flags);
     result = alignedResult;
   }
 
@@ -385,12 +383,10 @@ static void forEachFree(const internal::vector<Span> freeSpans[kSpanClassCount],
   }
 }
 
-char *MeshableArena::pageAlloc(Span &result, size_t pageCount, size_t pageAlignment) {
+char *MeshableArena::pageAllocLocked(Span &result, size_t pageCount, size_t pageAlignment) {
   if (pageCount == 0) {
     return nullptr;
   }
-  lock_guard<mutex> lock(_spanLock);
-
   d_assert(_arenaBegin != nullptr);
 
   d_assert(pageCount >= 1);
@@ -412,21 +408,6 @@ char *MeshableArena::pageAlloc(Span &result, size_t pageCount, size_t pageAlignm
 
   result = span;
   return ptr;
-}
-
-void MeshableArena::free(void *ptr, size_t sz, internal::PageType type) {
-  if (unlikely(!contains(ptr))) {
-    debug("invalid free of %p/%zu", ptr, sz);
-    return;
-  }
-  d_assert(sz > 0);
-
-  d_assert(sz / kPageSize > 0);
-  d_assert(sz % kPageSize == 0);
-
-  const Span span(offsetFor(ptr), sz / kPageSize);
-  lock_guard<mutex> lock(_spanLock);
-  freeSpan(span, type);
 }
 
 static size_t flushSpansByOffset(internal::vector<Span> freeSpans[kSpanClassCount], internal::vector<Span> &flushSpans,
@@ -537,7 +518,7 @@ void MeshableArena::getSpansFromBg(bool wait) {
     ska_sort(spanList.begin(), spanList.end(), [](auto &&span) -> decltype(auto) { return -span.length; });
     size_t size = spanList.size();
     for (size_t i = 0; i < size; ++i) {
-      setCleanIndex(spanList[i], i);
+      setCleanIndex(spanList[i], kSpanClassCount - 1, i);
     }
     narrowArena();
   }
@@ -613,10 +594,7 @@ void MeshableArena::releaseToReset() {
   tryAndSendToFreeLocked(unmapCommand);
 }
 
-void MeshableArena::partialScavenge() {
-  if (_dirtyPageCount < kMaxDirtyPageThreshold) {
-    return;
-  }
+void MeshableArena::flushDirtySpans() {
   size_t needFreeCount = _end / 5;
   internal::FreeCmd *freeCommand = new internal::FreeCmd(internal::FreeCmd::FREE_DIRTY_PAGE);
   size_t freeCount = flushSpansByOffset(_dirty, freeCommand->spans, _lastFlushBegin, needFreeCount);
@@ -631,36 +609,48 @@ void MeshableArena::partialScavenge() {
   tryAndSendToFreeLocked(freeCommand);
 }
 
-void MeshableArena::scavenge(bool force) {
+void MeshableArena::scavenge() {
   lock_guard<mutex> lock(_spanLock);
-  if (!force && _dirtyPageCount < kMinDirtyPageThreshold) {
-    return;
-  }
-
   if (!_toReset.empty()) {
     releaseToReset();
   }
 
-  internal::FreeCmd *freeCommand = new internal::FreeCmd(internal::FreeCmd::FREE_DIRTY_PAGE);
-
-  size_t needFreeCount = _end / 5;
-
-  size_t freeCount = flushSpansByOffset(_dirty, freeCommand->spans, _lastFlushBegin, needFreeCount);
-
-  _dirtyPageCount -= freeCount;
-
-  tryAndSendToFreeLocked(freeCommand);
-
-  _lastFlushBegin += needFreeCount;
-  if (_lastFlushBegin >= _end) {
-    _lastFlushBegin = 0;
+  if (_dirtyPageCount >= kMinDirtyPageThreshold) {
+    flushDirtySpans();
   }
 
   // debug("FreeCmd::CLEAN_PAGE");
-
   tryAndSendToFreeLocked(new internal::FreeCmd(internal::FreeCmd::FLUSH));
-
   getSpansFromBg();
+}
+
+MiniHeap *MeshableArena::allocMiniheap(size_t sizeClass, size_t arenaId, size_t pageCount, size_t objectCount,
+                                       size_t objectSize, size_t pageAlignment) {
+  d_assert(0 < pageCount);
+
+  Span span{0, 0};
+  void *buf;
+  {
+    lock_guard<mutex> lock(_spanLock);
+    buf = _mhAllocator.alloc();
+    d_assert(buf != nullptr);
+
+    // allocate out of the arena
+    char *__attribute__((__unused__)) spanBegin = pageAllocLocked(span, pageCount, pageAlignment);
+    d_assert(spanBegin != nullptr);
+    d_assert((reinterpret_cast<uintptr_t>(spanBegin) / kPageSize) % pageAlignment == 0);
+  }
+  MiniHeap *mh = new (buf) MiniHeap(arenaBegin(), span, objectCount, objectSize, arenaId);
+  trackMiniHeap(span, mh, sizeClass);
+  return mh;
+}
+
+void MeshableArena::freeMiniheap(MiniHeap *mh, internal::PageType flags) {
+  const Span span = mh->span();
+  mh->MiniHeap::~MiniHeap();
+  lock_guard<mutex> lock(_spanLock);
+  _mhAllocator.free(mh);
+  freeSpanLocked(span, flags);
 }
 
 void MeshableArena::freePhys(const Span &span) {

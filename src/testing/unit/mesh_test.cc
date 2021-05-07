@@ -35,16 +35,14 @@ static void meshTest(bool invert) {
 
   FixedArray<MiniHeap, 1> array{};
 
+  const auto sizeClass = SizeMap::SizeClass(StrLen);
+  const auto objectCount = SizeMap::ObjectCountForClass(sizeClass);
+  const auto objectSize = SizeMap::ByteSizeForClass(sizeClass);
+  const auto pageCount = SizeMap::SizeClassToPageCount(sizeClass);
+
   // allocate two miniheaps for the same object size from our global heap
-  gheap.allocSmallMiniheaps(SizeMap::SizeClass(StrLen), StrLen, array, tid);
-  MiniHeap *mh1 = array[0];
-  array.clear();
-
-  gheap.allocSmallMiniheaps(SizeMap::SizeClass(StrLen), StrLen, array, tid);
-  MiniHeap *mh2 = array[0];
-  array.clear();
-
-  ASSERT_EQ(gheap.getAllocatedMiniheapCount(), 2UL);
+  MiniHeap *mh1 = gheap.allocMiniheapLocked(sizeClass, 0, pageCount, objectCount, objectSize, 1);
+  MiniHeap *mh2 = gheap.allocMiniheapLocked(sizeClass, 0, pageCount, objectCount, objectSize, 1);
 
   // sanity checks
   ASSERT_TRUE(mh1 != mh2);
@@ -124,14 +122,13 @@ static void meshTest(bool invert) {
   ASSERT_TRUE(mh1->isEmpty());  // safe because mh1 isn't "done"
 
   note("ABOUT TO FREE");
-  gheap.freeMiniheap(mh1);
+  gheap.freeLargeMiniheap(mh1);
   note("DONE FREE");
 
   note("ABOUT TO SCAVENGE");
-  gheap.scavenge(true);
+  gheap.scavenge();
   note("DONE SCAVENGE");
 
-  ASSERT_EQ(gheap.getAllocatedMiniheapCount(), 0UL);
 }
 
 TEST(MeshTest, TryMesh) {

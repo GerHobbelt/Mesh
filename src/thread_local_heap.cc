@@ -48,7 +48,7 @@ ThreadLocalHeap *ThreadLocalHeap::NewHeap(pthread_t current) {
   hard_assert(buf != nullptr);
   hard_assert(reinterpret_cast<uintptr_t>(buf) % CACHELINE_SIZE == 0);
 
-  auto heap = new (buf) ThreadLocalHeap(&mesh::runtime().heap(), current);
+  auto heap = new (buf) ThreadLocalHeap(&mesh::runtime().heap(), mesh::runtime().heap().allocArena(), current);
 
   heap->_prev = nullptr;
   heap->_next = _threadLocalHeaps;
@@ -136,11 +136,11 @@ void ThreadLocalHeap::releaseAll() {
     if (!shuffleCache.isExhausted()) {
       if (shuffleCache.length() > SizeMap::NumToMoveForClass(i)) {
         uint32_t size = shuffleCache.pop_list(SizeMap::NumToMoveForClass(i), head);
-        _global->releaseToCentralCache(i, head, size, _current);
+        _arena->releaseToCentralCache(i, head, size, _current);
       }
       uint32_t size = shuffleCache.pop_list(shuffleCache.length(), head);
       if (size > 0) {
-        _global->releaseToCentralCache(i, head, size, _current);
+        _arena->releaseToCentralCache(i, head, size, _current);
       }
       d_assert(shuffleCache.isExhausted());
       d_assert(!shuffleCache.length());
@@ -153,13 +153,13 @@ void CACHELINE_ALIGNED_FN ThreadLocalHeap::releaseToCentralCache(size_t sizeClas
   void *head;
   uint32_t size = shuffleCache.pop_list(SizeMap::NumToMoveForClass(sizeClass), head);
   if (size) {
-    _global->releaseToCentralCache(sizeClass, head, size, _current);
+    _arena->releaseToCentralCache(sizeClass, head, size, _current);
     _freeCount = 0;
   }
 }
 
 void CACHELINE_ALIGNED_FN ThreadLocalHeap::flushCentralCache() {
-  _global->flushCentralCache();
+  _arena->flushCentralCache();
   _freeCount = 0;
 }
 
@@ -167,19 +167,22 @@ void CACHELINE_ALIGNED_FN ThreadLocalHeap::flushCentralCache() {
 void *CACHELINE_ALIGNED_FN ThreadLocalHeap::smallAllocSlowpath(size_t sizeClass) {
   ShuffleCache &shuffleCache = _shuffleCache[sizeClass];
   void *head;
-  if (_global->allocFromCentralCache(sizeClass, head)) {
-    uint32_t size = SizeMap::NumToMoveForClass(sizeClass);
+  uint32_t size;
+  if (_arena->allocFromCentralCache(sizeClass, head, size)) {
     shuffleCache.push_list(head, size);
     return shuffleCache.malloc();
   } else {
     ShuffleVector &shuffleVector = _shuffleVector[sizeClass];
-
-    mesh::MiniHeapArray miniheaps{};
-    const auto objectSize = SizeMap::ByteSizeForClass(sizeClass);
-
-    _global->allocSmallMiniheaps(sizeClass, objectSize, miniheaps, _current);
-    shuffleVector.reinit(miniheaps);
-    _global->releaseMiniheaps(sizeClass, miniheaps);
+    auto objectCount = shuffleVector.objectCount();
+    for (size_t i = 0; i < 3; ++i) {
+      internal::RelaxedFixedBitmap localBits{objectCount};
+      uintptr_t spanStart;
+      _arena->allocCentralCacheSlowly(sizeClass, objectCount, localBits, spanStart);
+      shuffleVector.refillFrom(spanStart, localBits);
+      if (shuffleCache.length() >= objectCount) {
+        break;
+      }
+    }
     return shuffleCache.malloc();
   }
 }

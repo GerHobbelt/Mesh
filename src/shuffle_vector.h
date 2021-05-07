@@ -21,8 +21,6 @@ using mesh::debug;
 
 namespace mesh {
 
-typedef FixedArray<MiniHeap, 4> MiniHeapArray;
-
 class ShuffleCache {
 public:
   inline void *ATTRIBUTE_ALWAYS_INLINE malloc() {
@@ -125,6 +123,7 @@ private:
   uint32_t _maxCount{0};
 };
 
+static constexpr size_t kShuffleVectorCache = 128;
 class ShuffleVector {
 private:
   DISALLOW_COPY_AND_ASSIGN(ShuffleVector);
@@ -135,81 +134,32 @@ public:
   }
 
   ~ShuffleVector() {
-    // d_assert(_attachedMiniheaps.size() == 0);
   }
 
   // post: list has the index of all bits set to 1 in it, in a random order
-  inline uint32_t ATTRIBUTE_ALWAYS_INLINE refillFrom(uintptr_t start, internal::Bitmap &bitmap) {
+  inline uint32_t ATTRIBUTE_ALWAYS_INLINE refillFrom(uintptr_t start, internal::RelaxedFixedBitmap &localBits) {
     const uint32_t objectCount = _objectCount;
     const uint32_t objectSize = _objectSize;
 
-    internal::RelaxedFixedBitmap newBitmap{objectCount};
-    newBitmap.setAll(objectCount);
-
-    internal::RelaxedFixedBitmap localBits{objectCount};
-    bitmap.setAndExchangeAll(localBits.mut_bits(), newBitmap.bits());
     localBits.invert();
-
     uint32_t allocCount = 0;
-
-    if (!kEnableShuffleOnInit) {
-      for (auto const &i : localBits) {
-        // FIXME: this incredibly lurky conditional is because
-        // RelaxedFixedBitmap iterates over all 256 bits it has,
-        // regardless of the _maxCount set in the constructor -- we
-        // should fix that.
-        if (i >= objectCount) {
-          break;
-        }
-        _cache->push(reinterpret_cast<void *>(start + i * objectSize));
-        ++allocCount;
+    for (auto const &i : localBits) {
+      // FIXME: this incredibly lurky conditional is because
+      // RelaxedFixedBitmap iterates over all 256 bits it has,
+      // regardless of the _maxCount set in the constructor -- we
+      // should fix that.
+      if (i >= objectCount) {
+        break;
       }
-    } else {
-      void *ptr[256];
-      for (auto const &i : localBits) {
-        if (i >= objectCount) {
-          break;
-        }
-        ptr[allocCount] = reinterpret_cast<void *>(start + i * objectSize);
-        ++allocCount;
-      }
-      internal::mwcShuffle(&ptr[0], &ptr[allocCount], _prng);
-      for (size_t i = 0; i < allocCount; ++i) {
-        _cache->push(ptr[i]);
-      }
+      void *p = reinterpret_cast<void *>(start + i * objectSize);
+      _cache->push(p);
+      ++allocCount;
     }
     return allocCount;
   }
 
   inline uint32_t objectCount() const {
     return _objectCount;
-  }
-
-  inline bool ATTRIBUTE_ALWAYS_INLINE localRefill(MiniHeapArray &miniheaps) {
-    uint32_t addedCapacity = 0;
-    const auto miniheapCount = miniheaps.size();
-    const auto maxRefill = _cache->maxCount() / 3;
-    for (uint32_t i = 0; i < miniheapCount && _cache->length() < maxRefill; i++) {
-      auto mh = miniheaps[i];
-      if (mh->isFull()) {
-        continue;
-      }
-      const auto allocCount = refillFrom(mh->getSpanStart(_arenaBegin), mh->writableBitmap());
-      addedCapacity |= allocCount;
-    }
-
-    if (addedCapacity > 0) {
-      return true;
-    }
-
-    return false;
-  }
-
-  // an attach takes ownership of the reference to mh
-  inline void reinit(MiniHeapArray &miniheaps) {
-    internal::mwcShuffle(miniheaps.array_begin(), miniheaps.array_end(), _prng);
-    const bool __attribute__((__unused__)) addedCapacity = localRefill(miniheaps);
-    d_assert(addedCapacity);
   }
 
   inline size_t getSize() {

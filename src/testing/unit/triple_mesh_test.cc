@@ -85,29 +85,17 @@ static void meshTestConcurrentWrite(bool invert1, bool invert2) {
 
   ASSERT_EQ(gheap.getAllocatedMiniheapCount(), 0UL);
 
-  FixedArray<MiniHeap, 1> array{};
+  const auto sizeClass = SizeMap::SizeClass(StrLen);
+  const auto objectCount = SizeMap::ObjectCountForClass(sizeClass);
+  const auto objectSize = SizeMap::ByteSizeForClass(sizeClass);
+  const auto pageCount = SizeMap::SizeClassToPageCount(sizeClass);
+  const auto objectSizeReciprocal = SizeMap::ObjectSizeReciprocalForClass(sizeClass);
 
   // allocate three miniheaps for the same object size from our global heap
-  gheap.allocSmallMiniheaps(SizeMap::SizeClass(StrLen), StrLen, array, tid);
-  MiniHeap *mh1 = array[0];
-  array.clear();
-
-  gheap.allocSmallMiniheaps(SizeMap::SizeClass(StrLen), StrLen, array, tid);
-  MiniHeap *mh2 = array[0];
-  array.clear();
-
-  gheap.allocSmallMiniheaps(SizeMap::SizeClass(StrLen), StrLen, array, tid);
-  MiniHeap *mh3 = array[0];
-  array.clear();
-
-  const auto sizeClass = mh1->sizeClass();
-  ASSERT_EQ(SizeMap::SizeClass(StrLen), sizeClass);
-
-  ASSERT_TRUE(mh1->isAttached());
-  ASSERT_TRUE(mh2->isAttached());
-  ASSERT_TRUE(mh3->isAttached());
-
-  ASSERT_EQ(gheap.getAllocatedMiniheapCount(), 3UL);
+  MiniHeap *mh1 = gheap.allocMiniheapLocked(sizeClass, 0, pageCount, objectCount, objectSize, 1);
+  MiniHeap *mh2 = gheap.allocMiniheapLocked(sizeClass, 0, pageCount, objectCount, objectSize, 1);
+  MiniHeap *mh3 = gheap.allocMiniheapLocked(sizeClass, 0, pageCount, objectCount, objectSize, 1);
+  ASSERT_EQ(mh1->sizeClass(), sizeClass);
 
   // sanity checks
   ASSERT_TRUE(mh1 != mh2);
@@ -130,18 +118,10 @@ static void meshTestConcurrentWrite(bool invert1, bool invert2) {
     const auto f2 = reinterpret_cast<char *>(mh2->mallocAt(gheap.arenaBegin(), 2));
     const auto f3 = reinterpret_cast<char *>(mh3->mallocAt(gheap.arenaBegin(), 2));
 
-    gheap.releaseMiniheapLocked(mh1, mh1->sizeClass());
-    gheap.releaseMiniheapLocked(mh2, mh1->sizeClass());
-    gheap.releaseMiniheapLocked(mh3, mh1->sizeClass());
-
     gheap.free(f1);
     gheap.free(f2);
     gheap.free(f3);
   }
-
-  ASSERT_TRUE(!mh1->isAttached());
-  ASSERT_TRUE(!mh2->isAttached());
-  ASSERT_TRUE(!mh3->isAttached());
 
   // fill in the strings, set the trailing null byte
   memset(s1, 'A', StrLen);
@@ -239,20 +219,15 @@ static void meshTestConcurrentWrite(bool invert1, bool invert2) {
   s3[0] = 'b';
   ASSERT_EQ(t3[0], 'b');
 
-  ASSERT_EQ(mh1->getOff(gheap.arenaBegin(), s1), 0);
-  ASSERT_EQ(mh1->getOff(gheap.arenaBegin(), s2), ObjCount - 1);
-  ASSERT_EQ(mh1->getOff(gheap.arenaBegin(), s3), 3);
+  ASSERT_EQ(mh1->getOff(gheap.arenaBegin(), s1, objectSizeReciprocal), 0);
+  ASSERT_EQ(mh1->getOff(gheap.arenaBegin(), s2, objectSizeReciprocal), ObjCount - 1);
+  ASSERT_EQ(mh1->getOff(gheap.arenaBegin(), s3, objectSizeReciprocal), 3);
 
   {
     const internal::vector<MiniHeap *> candidates = gheap.meshingCandidatesLocked(mh1->sizeClass());
     ASSERT_EQ(candidates.size(), 1ULL);
     ASSERT_EQ(candidates[0], mh1);
   }
-
-  // we need to attach the miniheap, otherwise
-  ASSERT_TRUE(!mh1->isAttached());
-  mh1->setAttached(gettid(), &gheap.freelistFor(mh1->freelistId(), sizeClass)->head);
-  ASSERT_TRUE(mh1->isAttached());
 
   // now free the objects by going through the global heap -- it
   // should redirect both objects to the same miniheap
@@ -264,14 +239,12 @@ static void meshTestConcurrentWrite(bool invert1, bool invert2) {
   ASSERT_TRUE(mh1->isEmpty());
 
   note("ABOUT TO FREE");
-  gheap.freeMiniheap(mh1);
+  gheap.freeLargeMiniheap(mh1);
   note("DONE FREE");
 
   note("ABOUT TO SCAVENGE");
-  gheap.scavenge(true);
+  gheap.scavenge();
   note("DONE SCAVENGE");
-
-  ASSERT_EQ(gheap.getAllocatedMiniheapCount(), 0UL);
 }
 
 TEST(TripleMeshTest, MeshAll) {

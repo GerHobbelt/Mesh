@@ -110,6 +110,10 @@ protected:
     oldBits[3] = _bits[3].exchange(newBits[3], std::memory_order_acq_rel);
   }
 
+  inline void ATTRIBUTE_ALWAYS_INLINE setAndExchange1(size_t *oldBits, const size_t *newBits) {
+    oldBits[0] = _bits[0].exchange(newBits[0], std::memory_order_acq_rel);
+  }
+
 public:
   inline bool ATTRIBUTE_ALWAYS_INLINE setAt(uint32_t item, uint32_t position) {
     const auto mask = getMask(position);
@@ -578,6 +582,10 @@ public:
 
   inline void setAndExchangeAll(size_t *oldBits, const size_t *newBits) {
     Super::setAndExchangeAll(oldBits, newBits);
+  }
+
+  inline void setAndExchange1(size_t *oldBits, const size_t *newBits) {
+    Super::setAndExchange1(oldBits, newBits);
   }
 
 private:

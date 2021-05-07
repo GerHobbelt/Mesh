@@ -43,9 +43,11 @@ private:
 public:
   enum { Alignment = 16 };
 
-  ThreadLocalHeap(GlobalHeap *global, pthread_t pthreadCurrent)
+  ThreadLocalHeap(GlobalHeap *global, Arena *arena, pthread_t pthreadCurrent)
       : _current(gettid()),
+        _arenaId(arena->id()),
         _global(global),
+        _arena(arena),
         _pthreadCurrent(pthreadCurrent),
         _prng(internal::seed(), internal::seed()),
         _maxObjectSize(SizeMap::ByteSizeForClass(kNumBins - 1)) {
@@ -55,11 +57,13 @@ public:
     for (size_t i = 1; i < kNumBins; i++) {
       _shuffleVector[i].initialInit(arenaBegin, i, &_shuffleCache[i]);
     }
+    _arena->incRefcount();
     d_assert(_global != nullptr);
   }
 
   ~ThreadLocalHeap() {
     releaseAll();
+    _arena->decRefcount();
   }
 
   // pthread_set_sepcific destructor
@@ -193,8 +197,10 @@ public:
       return;
 
     ++_freeCount;
-    const int sizeClass = _global->lookupSizeClass(ptr);
-    if (likely(sizeClass && sizeClass < kNumBins)) {
+    const uint64_t val = _global->lookupPtrIndex(ptr);
+    const uint32_t arenaId = (val >> 54);
+    const uint32_t sizeClass = (val >> 48) & kMask5;
+    if (likely(arenaId == _arenaId && sizeClass > 0 && sizeClass < kNumBins)) {
       ShuffleCache &shuffleCache = _shuffleCache[sizeClass];
       if (unlikely(shuffleCache.isFull())) {
         releaseToCentralCache(sizeClass);
@@ -202,10 +208,11 @@ public:
       shuffleCache.free(ptr);
       return;
     }
-    if (unlikely(_freeCount > 256)) {
+    if (unlikely(_freeCount > 2560)) {
       flushCentralCache();
     }
-    _global->free(ptr);
+    MiniHeap *mh = reinterpret_cast<MiniHeap *>(val & kMask48);
+    _global->free(ptr, arenaId, mh);
   }
 
   inline void ATTRIBUTE_ALWAYS_INLINE sizedFree(void *ptr, size_t sz) {
@@ -215,12 +222,17 @@ public:
   inline size_t getSize(void *ptr) {
     if (unlikely(ptr == nullptr))
       return 0;
-
-    const int sizeClass = _global->lookupSizeClass(ptr);
-    if (likely(sizeClass && sizeClass < kNumBins)) {
+    const uint64_t val = _global->lookupPtrIndex(ptr);
+    const uint32_t sizeClass = (val >> 48) & kMask5;
+    if (likely(sizeClass > 0 && sizeClass < kNumBins)) {
       return SizeMap::ByteSizeForClass(sizeClass);
     }
-    return _global->getSize(ptr);
+    MiniHeap *mh = reinterpret_cast<MiniHeap *>(val & kMask48);
+    if (likely(mh)) {
+      return mh->objectSize();
+    } else {
+      return 0;
+    }
   }
 
   static ThreadLocalHeap *NewHeap(pthread_t current);
@@ -248,8 +260,10 @@ protected:
   ShuffleVector _shuffleVector[kNumBins] CACHELINE_ALIGNED;
   ShuffleCache _shuffleCache[kNumBins];
   // this cacheline is read-mostly (only changed when creating + destroying threads)
-  const pid_t _current CACHELINE_ALIGNED{0};
+  const pid_t _current{0};
+  uint32_t _arenaId{0};
   GlobalHeap *_global;
+  Arena *_arena;
   size_t _freeCount{0};
   ThreadLocalHeap *_next{};  // protected by global heap lock
   ThreadLocalHeap *_prev{};

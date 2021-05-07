@@ -35,6 +35,7 @@
 #include "bitmap.h"
 
 #include "mmap_heap.h"
+#include "mini_heap.h"
 
 #ifndef MADV_DONTDUMP
 #define MADV_DONTDUMP 0
@@ -63,42 +64,37 @@ public:
     return arena <= ptrval && ptrval < end;
   }
 
-  char *pageAlloc(Span &result, size_t pageCount, size_t pageAlignment = 1);
+  char *pageAllocLocked(Span &result, size_t pageCount, size_t pageAlignment = 1);
 
-  void free(void *ptr, size_t sz, internal::PageType type);
-
-  inline void trackMiniHeap(const Span span, MiniHeap *mh, int sizeClass) {
+  inline void trackMiniHeap(const Span span, MiniHeap *mh, size_t sizeClass) {
     // now that we know they are available, set the empty pages to
     // in-use.  This is safe because this whole function is called
     // under the GlobalHeap lock, so there is no chance of concurrent
     // modification between the loop above and the one below.
-    const uint32_t miniheapID = _mhAllocator.offsetFor(mh);
+    const uint64_t arenaId = mh->arenaId();
+    uint64_t val = (arenaId << 54) | (sizeClass << 48) | reinterpret_cast<size_t>(mh);
 
     for (size_t i = 0; i < span.length; i++) {
-      setIndex(span.offset + i, miniheapID);
-      setSizeClass(span.offset + i, sizeClass);
+      setIndex(span.offset + i, val);
     }
   }
 
   inline void trackMeshedMiniHeap(const Span span, MiniHeap *mh) {
     // make meshed mh sizeClass == 0
     // so ThreadLocalCache won't cache it when free
+    const uint64_t arenaId = mh->arenaId();
+    uint64_t val = (arenaId << 54) | reinterpret_cast<size_t>(mh);
     for (size_t i = 0; i < span.length; i++) {
-      setSizeClass(span.offset + i, 0);
+      setIndex(span.offset + i, val);
     }
   }
 
   inline void *ATTRIBUTE_ALWAYS_INLINE miniheapForArenaOffset(Offset arenaOff) const {
-    const int32_t mhOff = _mhIndex[arenaOff].load(std::memory_order_acquire);
-    if (mhOff > 0) {
-      return _mhAllocator.ptrFromOffset(mhOff);
+    const uint64_t mhOff = _mhIndex[arenaOff].load(std::memory_order_acquire);
+    if ((mhOff >> 63) == 0 && mhOff > 0) {
+      return reinterpret_cast<void *>(mhOff & kMask48);
     }
     return nullptr;
-  }
-
-  inline int ATTRIBUTE_ALWAYS_INLINE sizeClassForArenaOffset(Offset arenaOff) const {
-    uint8_t val = _clIndex[arenaOff].load(std::memory_order_acquire);
-    return static_cast<int>(val);
   }
 
   inline void *ATTRIBUTE_ALWAYS_INLINE lookupMiniheap(const void *ptr) const {
@@ -112,7 +108,7 @@ public:
     return miniheapForArenaOffset(arenaOff);
   }
 
-  inline int ATTRIBUTE_ALWAYS_INLINE lookupSizeClass(const void *ptr) const {
+  inline uint64_t ATTRIBUTE_ALWAYS_INLINE lookupPtrIndex(const void *ptr) const {
     if (unlikely(!contains(ptr))) {
       return 0;
     }
@@ -120,7 +116,7 @@ public:
     // we've already checked contains, so we know this offset is
     // within bounds
     const auto arenaOff = offsetFor(ptr);
-    return sizeClassForArenaOffset(arenaOff);
+    return _mhIndex[arenaOff].load(std::memory_order_acquire);
   }
 
   void beginMesh(void *keep, void *remove, size_t sz);
@@ -142,9 +138,14 @@ public:
   void releaseToReset();
   // protected:
   // public for testing
-  void scavenge(bool force);
   // like a scavenge, but we only MADV_FREE
-  void partialScavenge();
+  void scavenge();
+
+  void flushDirtySpans();
+
+  MiniHeap *allocMiniheap(size_t sizeClass, size_t arenaId, size_t pageCount, size_t objectCount, size_t objectSize,
+                          size_t pageAlignment);
+  void freeMiniheap(MiniHeap *mh, internal::PageType flags);
 
   // return the maximum number of pages we've had meshed (and thus our
   // savings) at any point in time.
@@ -166,10 +167,25 @@ public:
     return reinterpret_cast<char *>(_arenaEnd);
   }
 
+  // pointer must already have been checked by `contains()` for bounds
+  inline Offset offsetFor(const void *ptr) const {
+    const uintptr_t ptrval = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t arena = reinterpret_cast<uintptr_t>(_arenaBegin);
+
+    d_assert(ptrval >= arena);
+
+    return (ptrval - arena) / kPageSize;
+  }
+
   void doAfterForkChild();
 
   void freePhys(const Span &span);
   void freePhys(void *ptr, size_t sz);
+
+  void freeSpan(const Span &span, const internal::PageType flags) {
+    lock_guard<mutex> lock(_spanLock);
+    freeSpanLocked(span, flags);
+  }
 
   inline void resetSpanMapping(const Span &span) {
     auto ptr = ptrFromOffset(span.offset);
@@ -223,7 +239,7 @@ private:
     }
   }
 
-  inline void freeSpan(const Span &span, const internal::PageType flags) {
+  inline void freeSpanLocked(const Span &span, const internal::PageType flags) {
     if (span.length == 0) {
       return;
     }
@@ -250,7 +266,7 @@ private:
       _dirtyPageCount += span.length;
 
       if (_dirtyPageCount > kMaxDirtyPageThreshold) {
-        partialScavenge();
+        flushDirtySpans();
       }
     } else if (flags == internal::PageType::Meshed) {
       // delay restoring the identity mapping
@@ -271,16 +287,6 @@ private:
   int openSpanFile(size_t sz);
   char *openSpanDir(int pid);
 
-  // pointer must already have been checked by `contains()` for bounds
-  inline Offset offsetFor(const void *ptr) const {
-    const uintptr_t ptrval = reinterpret_cast<uintptr_t>(ptr);
-    const uintptr_t arena = reinterpret_cast<uintptr_t>(_arenaBegin);
-
-    d_assert(ptrval >= arena);
-
-    return (ptrval - arena) / kPageSize;
-  }
-
   inline uintptr_t ptrvalFromOffset(size_t off) const {
     return reinterpret_cast<uintptr_t>(_arenaBegin) + off * kPageSize;
   }
@@ -289,46 +295,35 @@ private:
     return reinterpret_cast<void *>(ptrvalFromOffset(off));
   }
 
-  inline void setIndex(size_t off, uint32_t val) {
+  inline void setIndex(size_t off, uint64_t val) {
     d_assert(off < indexSize());
-    _mhIndex[off].store(static_cast<int32_t>(val), std::memory_order_release);
-  }
-
-  inline void setSizeClass(size_t off, uint8_t val) {
-    _clIndex[off].store(val, std::memory_order_release);
+    _mhIndex[off].store(val, std::memory_order_release);
   }
 
   inline void freeCleanSpan(const Span &span) {
     uint32_t spanClass = span.spanClass();
     uint32_t index = _clean[spanClass].size();
     _clean[spanClass].emplace_back(span);
-    setCleanIndex(span, index);
-    setCleanSpanClass(span, spanClass);
+    setCleanIndex(span, spanClass, index);
   }
 
-  inline void setCleanSpanClass(const Span &span, uint32_t spanClass) {
-    uint8_t val = static_cast<uint8_t>(spanClass);
-    _clIndex[span.offset].store(val, std::memory_order_release);
-    _clIndex[span.offset + span.length - 1].store(val, std::memory_order_release);
-  }
-
-  inline void setCleanIndex(const Span &span, uint32_t index) {
-    int32_t val = -static_cast<int32_t>(index + 1);
+  inline void setCleanIndex(const Span &span, uint32_t spanClass, uint32_t index) {
+    uint64_t val = (1ul << 63) | (static_cast<uint64_t>(spanClass) << 32) | index;
     _mhIndex[span.offset].store(val, std::memory_order_release);
     _mhIndex[span.endOffset()].store(val, std::memory_order_release);
   }
 
   inline void clearCleanIndex(const Span &span) {
-    int32_t val = 0;
+    uint64_t val = 0;
     _mhIndex[span.offset].store(val, std::memory_order_release);
     _mhIndex[span.endOffset()].store(val, std::memory_order_release);
   }
 
   inline void getCleanIndex(uint32_t off, uint32_t &spanClass, uint32_t &index) {
-    const int32_t mhOff = _mhIndex[off].load(std::memory_order_acquire);
-    if (mhOff < 0) {
-      spanClass = _clIndex[off].load(std::memory_order_acquire);
-      index = static_cast<uint32_t>(-mhOff) - 1;
+    const uint64_t val = _mhIndex[off].load(std::memory_order_acquire);
+    if (val >> 63) {
+      spanClass = (val >> 32) & 0xFFFFu;
+      index = val & kMask32;
     } else {
       spanClass = kSpanClassCount;
     }
@@ -340,8 +335,8 @@ private:
     }
     auto &clean = _clean[spanClass];
     std::swap(clean[i], clean[j]);
-    setCleanIndex(clean[i], i);
-    setCleanIndex(clean[j], j);
+    setCleanIndex(clean[i], spanClass, i);
+    setCleanIndex(clean[j], spanClass, j);
   }
 
   inline Span popCleanSpan(uint32_t spanClass, uint32_t index) {
@@ -351,7 +346,7 @@ private:
     Span span = clean[index];
     if (index != length - 1) {
       std::swap(clean[index], clean[length - 1]);
-      setCleanIndex(clean[index], index);
+      setCleanIndex(clean[index], spanClass, index);
     }
     d_assert(spanClass == span.spanClass());
     clean.pop_back();
@@ -380,8 +375,7 @@ private:
   void *_arenaBegin{nullptr};
   void *_arenaEnd{nullptr};
   // indexed by page offset.
-  atomic<int32_t> *_mhIndex{nullptr};
-  atomic<uint8_t> *_clIndex{nullptr};
+  atomic<uint64_t> *_mhIndex{nullptr};
 
 protected:
   inline void trackCOWed(const Span &span) {
